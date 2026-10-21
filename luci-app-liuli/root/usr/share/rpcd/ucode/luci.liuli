@@ -1,0 +1,884 @@
+// 琉璃看板 — Liuli router dashboard backend (thin data layer)
+//
+//  · getDevices()  DHCP leases / ARP / 无线关联 / nftables 每设备流量
+//  · getSystem()   机型 / 运行时间 / 负载 / 内存 / CPU / 温度 / 连接数 /
+//                  挂载点 / 服务启停状态 / 网络接口 / 无线射频
+//  · getLog()      系统日志 (ubus log read)
+//
+// Copyright 2026 likz0421
+// Licensed under the Apache License 2.0
+
+'use strict';
+
+import { popen, readfile, writefile, access, lsdir, glob, stat, unlink, rename, mkdir } from 'fs';
+import { connect } from 'ubus';
+
+const STATE_FILE = '/var/run/liuli-daily.json';
+
+/* ---------- helpers ---------- */
+
+function sh(cmd) {
+	const fd = popen(cmd + ' 2>/dev/null', 'r');
+	if (!fd)
+		return null;
+	const out = fd.read('all');
+	fd.close();
+	return out;
+}
+
+function today() {
+	const out = sh('date +%F');
+	return out ? trim(out) : '';
+}
+
+function ubusCall(obj, method, args) {
+	const ubus = connect();
+	if (!ubus)
+		return null;
+	try {
+		return ubus.call(obj, method, args ?? {});
+	} catch (e) {
+		return null;
+	}
+}
+
+function read_json(path) {
+	if (!access(path))
+		return null;
+	try {
+		const s = readfile(path);
+		if (s)
+			return json(s);
+	} catch (e) {}
+	return null;
+}
+
+function is_ipv4(s) {
+	return type(s) == 'string' && match(s, /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/) != null;
+}
+
+function num(s) {
+	const n = int(trim(String(s ?? '')));
+	return (n == null) ? 0 : n;
+}
+
+/* ---------- 设备相关数据 ---------- */
+
+function readLeases() {
+	const leases = [];
+	const s = readfile('/tmp/dhcp.leases');
+	if (!s)
+		return leases;
+	for (let line of split(s, '\n')) {
+		const f = split(trim(line), /[ \t]+/);
+		if (length(f) < 4)
+			continue;
+		leases.push({
+			mac: f[1],
+			ip: f[2],
+			hostname: (f[3] != '*') ? f[3] : null,
+			expiry: f[0]
+		});
+	}
+	return leases;
+}
+
+function readArp() {
+	const arp = [];
+	const s = readfile('/proc/net/arp');
+	if (!s)
+		return arp;
+	for (let line of split(s, '\n')) {
+		const f = split(trim(line), /[ \t]+/);
+		if (length(f) < 6)
+			continue;
+		if (f[2] != '0x2' || f[3] == '00:00:00:00:00:00')
+			continue;
+		arp.push({ mac: f[3], ip: f[0], device: f[5] });
+	}
+	return arp;
+}
+
+function readStations() {
+	const stations = [];
+	const radios = ubusCall('luci-rpc', 'getWirelessDevices') ?? {};
+
+	for (let name, radio in radios) {
+		const ifaces = radio?.interfaces ?? [];
+		for (let ifc of ifaces) {
+			const dev = (type(ifc) == 'string') ? ifc : (ifc?.ifname ?? null);
+			if (!dev)
+				continue;
+			let res = null;
+			try {
+				const ubus = connect();
+				res = ubus?.call('iwinfo', 'assoclist', { device: dev });
+			} catch (e) {}
+			for (let st of (res?.results ?? [])) {
+				if (st?.mac)
+					stations.push({
+						mac: st.mac,
+						signal: (st.signal != null) ? st.signal : null,
+						noise: (st.noise != null) ? st.noise : null,
+						iface: dev
+					});
+			}
+		}
+	}
+	return stations;
+}
+
+function selfMacs() {
+	const macs = [];
+	const devs = ubusCall('network.device', 'status') ?? {};
+	for (let name, dev in devs)
+		if (dev?.macaddr)
+			macs.push(dev.macaddr);
+	return macs;
+}
+
+/* ---------- nftables 每设备流量 ---------- */
+
+function listRules() {
+	const out = sh('nft -j list chain inet liuli_account device_traffic');
+	const rules = [];
+	if (!out)
+		return rules;
+	let data = null;
+	try { data = json(out); } catch (e) { return rules; }
+
+	for (let item of (data?.nftables ?? [])) {
+		const rule = item?.rule;
+		if (!rule?.expr)
+			continue;
+		let dir = null, ip = null, bytes = 0;
+		for (let ex of rule.expr) {
+			const field = ex?.match?.left?.payload?.field;
+			if (field)
+				dir = field;
+			if (ex?.match?.right)
+				ip = ex.match.right;
+			if (ex?.counter)
+				bytes = ex.counter.bytes ?? 0;
+		}
+		if (dir && ip)
+			rules.push({ dir: dir, ip: ip, bytes: bytes, handle: rule.handle });
+	}
+	return rules;
+}
+
+function syncAccounting(ipList) {
+	if (!sh('nft list table inet liuli_account'))
+		sh("nft add table inet liuli_account");
+	if (!sh('nft list chain inet liuli_account device_traffic'))
+		sh("nft 'add chain inet liuli_account device_traffic { type filter hook forward priority filter + 5; policy accept; }'");
+
+	const rules = listRules();
+	const present = {};
+	for (let r of rules)
+		if (r.dir == 'saddr')
+			present[r.ip] = 1;
+
+	const live = {};
+	for (let ip of ipList) {
+		if (!is_ipv4(ip))
+			continue;
+		live[ip] = 1;
+		if (!present[ip]) {
+			sh(`nft add rule inet liuli_account device_traffic ip saddr ${ip} counter`);
+			sh(`nft add rule inet liuli_account device_traffic ip daddr ${ip} counter`);
+		}
+	}
+
+	for (let r of rules)
+		if (!live[r.ip])
+			sh(`nft delete rule inet liuli_account device_traffic handle ${r.handle}`);
+}
+
+function todayTraffic() {
+	const state = read_json(STATE_FILE) ?? { date: '', baseline: {} };
+	const rules = listRules();
+	const counters = {};
+
+	for (let r of rules) {
+		counters[r.ip] = counters[r.ip] ?? { rx: 0, tx: 0 };
+		if (r.dir == 'saddr')
+			counters[r.ip].rx = r.bytes;
+		else if (r.dir == 'daddr')
+			counters[r.ip].tx = r.bytes;
+	}
+
+	const date = today();
+	const result = {};
+
+	if (state.date != date) {
+		const baseline = {};
+		for (let ip in counters)
+			baseline[ip] = { rx: counters[ip].rx, tx: counters[ip].tx };
+		try {
+			writefile(STATE_FILE, sprintf('%J', { date: date, baseline: baseline }));
+		} catch (e) {}
+		state.baseline = baseline;
+		state.date = date;
+	}
+
+	const base = (state.baseline && type(state.baseline) == 'object') ? state.baseline : {};
+
+	for (let ip in counters) {
+		const b = base[ip] ?? { rx: 0, tx: 0 };
+		result[ip] = {
+			rx: (counters[ip].rx > b.rx) ? (counters[ip].rx - b.rx) : 0,
+			tx: (counters[ip].tx > b.tx) ? (counters[ip].tx - b.tx) : 0
+		};
+	}
+	return result;
+}
+
+/* ---------- 系统概况 ---------- */
+
+function boardInfo() {
+	const b = ubusCall('system', 'board') ?? {};
+	const rel = b.release ?? {};
+	return {
+		hostname: b.hostname ?? null,
+		model: b.model ?? null,
+		system: b.system ?? null,
+		kernel: b.kernel ?? null,
+		target: rel.target ?? null,
+		distribution: rel.distribution ?? null,
+		version: rel.version ?? null,
+		revision: rel.revision ?? null,
+		description: rel.description ?? null
+	};
+}
+
+function systemInfo() {
+	const i = ubusCall('system', 'info') ?? {};
+	const mem = i.memory ?? {};
+	const swp = i.swap ?? {};
+	return {
+		uptime: i.uptime ?? 0,
+		localtime: i.localtime ?? time(),
+		load: i.load ?? [0, 0, 0],
+		processes: i.processes ?? 0,
+		memory: {
+			total: mem.total ?? 0,
+			free: mem.free ?? 0,
+			shared: mem.shared ?? 0,
+			buffered: mem.buffered ?? 0,
+			available: (mem.available != null) ? mem.available : null
+		},
+		swap: {
+			total: swp.total ?? 0,
+			free: swp.free ?? 0
+		}
+	};
+}
+
+function cpuInfo() {
+	const s = readfile('/proc/cpuinfo');
+	let count = 0, model = null, hardware = null, revision = null, mips = null;
+
+	if (s) {
+		for (let line of split(s, '\n')) {
+			line = trim(line);
+			if (!line)
+				continue;
+			const idx = index(line, ':');
+			if (idx == null || idx < 0)
+				continue;
+			const key = trim(substr(line, 0, idx));
+			const val = trim(substr(line, idx + 1));
+			if (key == 'processor')
+				count++;
+			else if (key == 'model name' && !model)
+				model = val;
+			else if (key == 'Hardware' && !hardware)
+				hardware = val;
+			else if (key == 'Revision' && !revision)
+				revision = val;
+			else if (key == 'BogoMIPS' && !mips)
+				mips = val;
+		}
+	}
+	if (!count)
+		count = 1;
+
+	const usage = trim(sh("top -n1 | awk '/^CPU/ {printf(\"%d\", 100 - $8)}'") ?? '');
+	let pct = int(usage);
+	if (pct == null)
+		pct = null;
+
+	return {
+		count: count,
+		model: model ?? hardware ?? null,
+		hardware: hardware,
+		revision: revision,
+		bogomips: mips,
+		usage: pct
+	};
+}
+
+function tempInfo() {
+	const zones = [];
+	const paths = glob('/sys/class/thermal/thermal_zone*/temp') ?? [];
+	sort(paths);
+
+	for (let i = 0; i < length(paths); i++) {
+		const p = paths[i];
+		const raw = readfile(p);
+		if (!raw)
+			continue;
+		const v = int(trim(raw));
+		if (!v)
+			continue;
+		const tp = substr(p, 0, length(p) - 4) + 'type';
+		let name = null;
+		if (access(tp))
+			name = trim(readfile(tp) ?? '');
+		zones.push({ zone: name ?? ('zone' + i), value: v / 1000 });
+	}
+
+	let text = null;
+	if (access('/sbin/tempinfo')) {
+		const t = sh('/sbin/tempinfo');
+		if (t)
+			text = trim(t);
+	}
+
+	return { zones: zones, text: text };
+}
+
+function conntrackInfo() {
+	let count = null, max = null;
+	if (access('/proc/sys/net/netfilter/nf_conntrack_count'))
+		count = num(readfile('/proc/sys/net/netfilter/nf_conntrack_count'));
+	if (access('/proc/sys/net/netfilter/nf_conntrack_max'))
+		max = num(readfile('/proc/sys/net/netfilter/nf_conntrack_max'));
+	return { count: count, max: max };
+}
+
+function mountPoints() {
+	const out = [];
+	const s = sh('df -kPl');
+	if (!s)
+		return out;
+
+	for (let line of split(s, '\n')) {
+		line = trim(line);
+		if (!line)
+			continue;
+		if (substr(line, 0, 10) == 'Filesystem')
+			continue;
+		const f = split(line, /[ \t]+/);
+		if (length(f) < 6)
+			continue;
+		const kb = num(f[1]);
+		if (!kb)
+			continue;
+		out.push({
+			device: f[0],
+			mount: f[5],
+			size: kb * 1024,
+			used: num(f[2]) * 1024,
+			avail: num(f[3]) * 1024,
+			percent: num(replace(f[4], '%', ''))
+		});
+	}
+	return out;
+}
+
+function services() {
+	let scripts = lsdir('/etc/init.d') ?? [];
+	scripts = filter(scripts, (s) => substr(s, 0, 1) != '.');
+	sort(scripts);
+
+	const rcd = lsdir('/etc/rc.d') ?? [];
+	let idx = {}, en = {};
+
+	for (let e of rcd) {
+		if (substr(e, 0, 1) != 'S')
+			continue;
+		const rest = substr(e, 1);
+		const nn = substr(rest, 0, 2);
+		const nm = substr(rest, 2);
+		if (length(nm) < 1 || match(nn, /^[0-9][0-9]$/) == null)
+			continue;
+		en[nm] = true;
+		idx[nm] = int(nn);
+	}
+
+	const running = {};
+	const sl = ubusCall('service', 'list') ?? {};
+	for (let name, svc in sl) {
+		let n = 0;
+		let pids = [];
+		for (let iname, inst in (svc?.instances ?? {}))
+			if (inst?.running) {
+				n++;
+				if (inst?.pid)
+					push(pids, inst.pid);
+			}
+		running[name] = { running: (n > 0), instances: n, pids: pids };
+	}
+
+	const out = [];
+	for (let s of scripts) {
+		const st = running[s] ?? {};
+		out.push({
+			name: s,
+			index: idx[s] ?? null,
+			enabled: en[s] ?? false,
+			running: st.running ?? false,
+			instances: st.instances ?? 0
+		});
+	}
+	return out;
+}
+
+function deviceStats() {
+	const devs = ubusCall('network.device', 'status') ?? {};
+	const out = {};
+
+	for (let name, d in devs) {
+		const st = d?.statistics ?? {};
+		out[name] = {
+			rx_bytes: st.rx_bytes ?? 0,
+			tx_bytes: st.tx_bytes ?? 0,
+			rx_packets: st.rx_packets ?? 0,
+			tx_packets: st.tx_packets ?? 0
+		};
+	}
+	return out;
+}
+
+function processes() {
+	const s = sh('top -bn1');
+	const out = [];
+
+	if (!s)
+		return out;
+
+	let started = false;
+
+	for (let line of split(s, '\n')) {
+		if (!started) {
+			if (match(line, /^\s*PID\s+PPID\s+USER/))
+				started = true;
+			continue;
+		}
+
+		const l = trim(line);
+		if (!l)
+			continue;
+
+		const f = split(l, /[ \t]+/);
+		if (length(f) < 8)
+			continue;
+
+		push(out, {
+			pid: num(f[0]),
+			ppid: num(f[1]),
+			user: f[2],
+			stat: f[3],
+			vsz: num(f[4]),
+			cpu: num(replace(f[6], '%', '')),
+			command: join(' ', slice(f, 7))
+		});
+
+		if (length(out) >= 12)
+			break;
+	}
+	return out;
+}
+
+function interfaces() {
+	const dump = ubusCall('network.interface', 'dump') ?? {};
+	const stats = deviceStats();
+	const out = [];
+
+	for (let ifc of (dump?.interface ?? [])) {
+		const a4 = (ifc['ipv4-address'] ?? [])[0] ?? null;
+		const a6 = (ifc['ipv6-address'] ?? [])[0] ?? null;
+
+		let gw4 = null, gw6 = null;
+		for (let rt of (ifc.route ?? [])) {
+			if (rt?.table && rt.table != 'main')
+				continue;
+			if (rt?.target == '0.0.0.0' && rt?.mask == 0 && !gw4)
+				gw4 = rt.nexthop;
+			else if (rt?.target == '::' && rt?.mask == 0 && !gw6)
+				gw6 = rt.nexthop;
+		}
+
+		const dns = [];
+		for (let d of (ifc['dns-server'] ?? []))
+			push(dns, d);
+
+		out.push({
+			interface: ifc.interface,
+			device: ifc.l3_device ?? ifc.device ?? null,
+			up: !!ifc.up,
+			available: !!ifc.available,
+			autostart: !!ifc.autostart,
+			pending: !!ifc.pending,
+			proto: ifc.proto ?? null,
+			uptime: ifc.uptime ?? 0,
+			macaddr: ifc.macaddr ?? null,
+			ip4: a4 ? { address: a4.address, mask: a4.mask } : null,
+			ip6: a6 ? { address: a6.address, mask: a6.mask } : null,
+			gateway: gw4,
+			gateway6: gw6,
+			dns: dns,
+			stats: stats[ifc.l3_device ?? ifc.device] ?? null,
+			is_wan: (gw4 != null || gw6 != null) || match(ifc.interface ?? '', /^wan/i) != null
+		});
+	}
+	return out;
+}
+
+function wirelessRadios() {
+	const st = ubusCall('network.wireless', 'status') ?? {};
+	const out = [];
+
+	for (let radio, r in st) {
+		const ifaces = [];
+		for (let i of (r?.interfaces ?? [])) {
+			const cfg = i?.config ?? {};
+			ifaces.push({
+				ifname: i?.ifname ?? null,
+				ssid: cfg.ssid ?? null,
+				mode: cfg.mode ?? null,
+				encryption: cfg.encryption ?? null,
+				hidden: !!cfg.hidden,
+				disabled: !!cfg.disabled,
+				network: cfg.network ?? []
+			});
+		}
+		out.push({
+			radio: radio,
+			up: !!r?.up,
+			disabled: !!r?.disabled,
+			pending: !!r?.pending,
+			channel: r?.channel ?? null,
+			frequency: r?.frequency ?? null,
+			txpower: r?.txpower ?? null,
+			quality: r?.quality ?? null,
+			quality_max: r?.quality_max ?? null,
+			noise: r?.noise ?? null,
+			bitrate: r?.bitrate ?? null,
+			hwmode: r?.config?.hwmode ?? null,
+			band: r?.config?.band ?? null,
+			country: r?.config?.country ?? null,
+			interfaces: ifaces
+		});
+	}
+	return out;
+}
+
+function logEntries(n) {
+	const count = int(n) || 40;
+	const res = ubusCall('log', 'read', { lines: count, stream: false, oneshot: true });
+	const out = [];
+
+	if (!res)
+		return out;
+
+	let raw = res.log ?? res.lines ?? null;
+
+	if (raw && type(raw) == 'array') {
+		for (let e of raw) {
+			if (type(e) == 'array')
+				out.push({ time: e[0] ?? null, priority: e[1] ?? 6, msg: trim(String(e[3] ?? e[2] ?? '')) });
+			else if (type(e) == 'object')
+				out.push({
+					time: e.time ?? null,
+					priority: (e.priority != null) ? e.priority : 6,
+					msg: trim(String(e.msg ?? e.message ?? ''))
+				});
+		}
+	}
+
+	/* 降级: logd 不可用时读 syslog 环外文件 */
+	if (!length(out)) {
+		const fallback = sh('logread -l ' + count);
+		if (fallback)
+			for (let line of split(fallback, '\n')) {
+				line = trim(line);
+				if (line)
+					out.push({ time: null, priority: 6, msg: line });
+			}
+	}
+
+	return out;
+}
+
+/* ---------- 外网延迟探测 (借鉴 Open-Box 的延迟测速卡) ---------- */
+
+function shellquote(s) {
+	return replace(String(s ?? ''), /[^0-9a-zA-Z._:-]/g, '');
+}
+
+/* ucode 没有 parseFloat / Number:
+ * 乘法运算会强制把数字字符串转成数值 ("12.4" * 1 → 12.4) */
+function toNum(s) {
+	if (type(s) == 'int' || type(s) == 'double')
+		return s;
+	const n = s * 1;
+	return (type(n) == 'int' || type(n) == 'double') ? n : null;
+}
+
+/* 探测单个目标: 返回毫秒数 (失败为 null)。先 IPv4 后 IPv6。
+ * 仅在并行探测整体失败时作为兜底使用 (单目标 2s 上限)。 */
+function probeOne(host) {
+	let out = sh('ping -c 1 -W 1 ' + shellquote(host) + ' 2>/dev/null');
+	if (!out)
+		out = sh('ping6 -c 1 -W 1 ' + shellquote(host) + ' 2>/dev/null');
+	if (!out)
+		return null;
+
+	let ms = null;
+	const m = match(out, /time[<=]?\s*([0-9.]+)\s*ms/);
+	if (m)
+		ms = toNum(m[1]);
+	if (ms == null) {
+		const m2 = match(out, /min\/avg\/max\s*=\s*[0-9.]+\/([0-9.]+)\//);
+		if (m2)
+			ms = toNum(m2[1]);
+	}
+	return ms;
+}
+
+/* 并行探测多个目标。
+ * 为什么不循环调 probeOne: rpcd 的 ucode 对象是串行处理的, 3 个目标各阻塞 1s
+ * 会让整台路由器的 LuCI 接口卡住 3s。这里把所有 ping 放进同一个 sh(), 用
+ * 后台子 shell 并发执行再 wait, 总耗时 ≈ 1s。
+ * 每个子 shell 输出 "<host>|<ms>" (超时则 ms 为空串)。 */
+function pingBatch(hosts) {
+	const cmds = [];
+	const ok = [];
+
+	for (let i = 0; i < length(hosts); i++) {
+		const h = shellquote(hosts[i]);
+		if (h == '')
+			continue;
+		ok.push(hosts[i]);
+		/* 同时兼容 "time=12.4 ms" 和 BusyBox 的 "time<1 ms" */
+		const grab = "awk '/time/{sub(/^.*time[<=]? */,\"\"); sub(/ *ms.*/,\"\"); print; exit}'";
+		cmds.push(
+			'( m=$(ping -c 1 -W 1 ' + h + ' 2>/dev/null | ' + grab + '); ' +
+			'[ -z "$m" ] && m=$(ping6 -c 1 -W 1 ' + h + ' 2>/dev/null | ' + grab + '); ' +
+			'echo "' + h + '|$m" ) &'
+		);
+	}
+
+	if (!length(cmds))
+		return [];
+
+	const out = sh(join('', cmds) + ' wait');
+	const got = {};
+
+	if (out != null) {
+		for (let line of split(out, '\n')) {
+			line = trim(line);
+			if (line == '')
+				continue;
+			const p = split(line, '|');
+			if (length(p) < 2)
+				continue;
+			const v = trim(p[1]);
+			if (v != '' && match(v, /^[0-9]+(\.[0-9]+)?$/))
+				got[p[0]] = toNum(v);
+		}
+	}
+
+	const res = [];
+	for (let i = 0; i < length(ok); i++)
+		res.push({ host: ok[i], ms: (got[ok[i]] != null ? got[ok[i]] : null) });
+
+	return res;
+}
+
+/* ---------- 登录背景资源管理 (借鉴 argon 的登录背景管理器) ---------- */
+
+/* 背景资源目录: 与设置页上传目标 (/www/luci-static/liuli/liuli-bg,
+ * /www/luci-static/liuli/liuli-login-bg) 保持一致, 这样上传后能立刻出现在列表里 */
+const BG_DIR = '/www/luci-static/liuli';
+
+/* 文件是否为可用的背景媒体 (显式大小写类, 不依赖 regex 的 /i 标志) */
+function bgMedia(name) {
+	return match(name,
+		/\.([jJ][pP][gG]|[jJ][pP][eE][gG]|[pP][nN][gG]|[wW][eE][bB][pP]|[gG][iI][fF]|[aA][vV][iI][fF]|[bB][mM][pP]|[mM][pP]4|[wW][eE][bB][mM]|[oO][gG][gG])$/
+	) != null;
+}
+
+function safeName(s) {
+	if (type(s) != 'string' || match(s, /^[A-Za-z0-9._-]{1,128}$/) == null)
+		return null;
+	/* 只允许媒体文件, 防止误删 css/cascade.css 之类的主题资源 */
+	return bgMedia(s) ? s : null;
+}
+
+/* 是否为视频背景 (登录页用 <video> 渲染) */
+function bgVideo(name) {
+	return match(name, /\.([mM][pP]4|[wW][eE][bB][mM]|[oO][gG][gG])$/) != null;
+}
+
+function ensureBgDir() {
+	/* 不传 mode: 用进程 umask 的默认权限, 避免八进制字面量在 ucode 里的歧义 */
+	if (!access(BG_DIR))
+		mkdir(BG_DIR);
+}
+
+/* ---------- RPC ---------- */
+
+const methods = {
+	getDevices: {
+		call: function(request) {
+			const leases = readLeases();
+			const arp = readArp();
+			const stations = readStations();
+
+			const ips = {};
+			for (let l of leases)
+				if (is_ipv4(l.ip))
+					ips[l.ip] = 1;
+			for (let a of arp)
+				if (is_ipv4(a.ip))
+					ips[a.ip] = 1;
+			const ipList = [];
+			for (let ip in ips)
+				ipList.push(ip);
+
+			syncAccounting(ipList);
+			const traffic = todayTraffic();
+
+			return {
+				leases: leases,
+				arp: arp,
+				stations: stations,
+				traffic: traffic,
+				self_macs: selfMacs(),
+				date: today()
+			};
+		}
+	},
+
+	getSystem: {
+		call: function(request) {
+			return {
+				board: boardInfo(),
+				system: systemInfo(),
+				cpu: cpuInfo(),
+				temp: tempInfo(),
+				conntrack: conntrackInfo(),
+				mounts: mountPoints(),
+				services: services(),
+				interfaces: interfaces(),
+				wireless: wirelessRadios(),
+				procs: processes(),
+				date: today()
+			};
+		}
+	},
+
+	getLog: {
+		args: { lines: 40 },
+		call: function(request) {
+			return { log: logEntries(request?.args?.lines ?? 40) };
+		}
+	},
+
+	/* Open-Box 风格的外网延迟探测: 一次并发探测多个目标, 返回每个目标的时延(ms) */
+	ping: {
+		args: { targets: [] },
+		call: function(request) {
+			let targets = request?.args?.targets;
+			if (type(targets) != 'array' || !length(targets))
+				targets = [ '223.5.5.5', 'baidu.com', 'qq.com' ];
+			if (length(targets) > 6)
+				targets = slice(targets, 0, 6);
+
+			let results = pingBatch(targets);
+
+			/* 并发探测全灭: 可能是精简固件缺 awk / 不支持后台任务,
+			 * 退回逐个 ping (慢但兼容) */
+			let any = false;
+			for (let i = 0; i < length(results); i++)
+				if (results[i].ms != null) {
+					any = true;
+					break;
+				}
+			if (!any) {
+				const fallback = [];
+				for (let i = 0; i < length(targets); i++) {
+					const host = shellquote(targets[i]);
+					if (host == '')
+						continue;
+					fallback.push({ host: targets[i], ms: probeOne(host) });
+				}
+				results = fallback;
+			}
+
+			return { results: results, ts: unixtime() };
+		}
+	},
+
+	/* 背景资源管理: 列出 /www/luci-static/liuli 下已上传的图片/视频
+	 * (设置页上传的 liuli-bg / liuli-login-bg 就在这个目录, 与 Background 管理器同源) */
+	bgList: {
+		call: function(request) {
+			ensureBgDir();
+			if (!access(BG_DIR))
+				return { list: [] };
+			const names = lsdir(BG_DIR) ?? [];
+			const list = [];
+			for (let i = 0; i < length(names); i++) {
+				const n = names[i];
+				if (!safeName(n))
+					continue;
+				const st = stat(BG_DIR + '/' + n);
+				if (st && st.type == 'file')
+					list.push({
+						name: n,
+						size: st.size,
+						mtime: st.mtime,
+						video: bgVideo(n),
+						url: '/luci-static/liuli/' + n
+					});
+			}
+			list.sort((a, b) => b.mtime - a.mtime);
+			return { list: list };
+		}
+	},
+
+	bgRemove: {
+		args: { name: '' },
+		call: function(request) {
+			const n = safeName(request?.args?.name);
+			if (!n)
+				return { error: 'invalid name' };
+			const p = BG_DIR + '/' + n;
+			if (!access(p))
+				return { error: 'not found' };
+			unlink(p);
+			return { ok: true };
+		}
+	},
+
+	bgRename: {
+		args: { name: '', newname: '' },
+		call: function(request) {
+			const n = safeName(request?.args?.name);
+			const nn = safeName(request?.args?.newname);
+			if (!n || !nn)
+				return { error: 'invalid name' };
+			if (!access(BG_DIR + '/' + n))
+				return { error: 'not found' };
+			rename(BG_DIR + '/' + n, BG_DIR + '/' + nn);
+			return { ok: true };
+		}
+	}
+};
+
+return { liuli: methods };

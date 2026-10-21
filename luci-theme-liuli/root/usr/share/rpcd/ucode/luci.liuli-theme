@@ -1,0 +1,66 @@
+// 琉璃主题 — 配置导入 / 导出后端
+//
+//  · getConfig()  读取 /etc/config/liuli 原文 (导出用)
+//  · setConfig()  写入 /etc/config/liuli 并提交 uci (导入用)
+//
+// 与看板后端 luci.liuli 同构: 文件返回 { "liuli-theme": methods },
+// 对外 ubus 对象名为 luci.liuli-theme。
+//
+// Copyright 2026 likz0421
+// Licensed under the Apache License 2.0
+
+'use strict';
+
+import { readfile, writefile, access } from 'fs';
+import { connect } from 'ubus';
+
+const CONFIG_PATH = '/etc/config/liuli';
+
+function commitLiuli() {
+	const ubus = connect();
+	if (!ubus)
+		return false;
+	try {
+		ubus.call('uci', 'commit', { config: 'liuli' });
+		return true;
+	} catch (e) {
+		return false;
+	}
+}
+
+const methods = {
+	getConfig: {
+		call: function (request) {
+			if (!access(CONFIG_PATH))
+				return { config: '' };
+			const cfg = readfile(CONFIG_PATH);
+			return { config: (cfg != null) ? cfg : '' };
+		}
+	},
+
+	setConfig: {
+		args: { config: '' },
+		call: function (request) {
+			const cfg = request?.args?.config;
+
+			if (type(cfg) != 'string' || trim(cfg) == '')
+				return { error: 'empty' };
+
+			/* 安全校验: 只接受看上去是 liuli 主题配置的内容,
+			 * 拒绝显然非 UCI / 非 liuli 的粘贴, 避免误覆盖 */
+			if (match(cfg, /config\s+theme\s+['"]main['"]/) == null)
+				return { error: 'not-liuli-config' };
+
+			try {
+				writefile(CONFIG_PATH, cfg);
+			} catch (e) {
+				return { error: 'write-failed' };
+			}
+
+			commitLiuli();
+			return { ok: true };
+		}
+	}
+};
+
+return { "liuli-theme": methods };

@@ -1,0 +1,121 @@
+{#
+	琉璃 Liuli — LuCI glassmorphism theme
+	Shared document head. 读取 /etc/config/liuli 注入用户自定义样式。
+-#}
+
+{%
+	import { cursor } from 'uci';
+	/* ucode 的全局函数表里并没有 JS 风格的 String 构造器
+	   (jow-/ucode lib.c 只注册了 71 个内置: chr/die/int/sprintf/min/max/
+	    uniq/match/... 全都没有它)。在模板里对它做函数调用会抛
+	    "left-hand side is not a function", 让整个 LuCI 500。
+	    这里用模板字面量实现等价的安全转字符串。 */
+	const liuli_str = (v) => (v == null ? '' : `${v}`);
+
+	const boardinfo = ubus.call('system', 'board');
+	const hostname = striptags(boardinfo?.hostname ?? '?');
+
+	/* 用户自定义 (来自 系统 → 琉璃主题设置) */
+	const u = cursor();
+	const raw = (k, d) => (u.get('liuli', 'main', k) ?? d);
+	const color = (k, d) => {
+		const v = liuli_str(raw(k, d) ?? '');
+		return match(v, /^#[0-9a-fA-F]{6}$/) ? v : d;
+	};
+	const num = (k, d) => {
+		const v = liuli_str(raw(k, d) ?? '');
+		return match(v, /^[0-9]{1,3}$/) ? int(v) : d;
+	};
+	const safe = (k, d) => {
+		const v = liuli_str(raw(k, d) ?? '');
+		return match(v, /^[A-Za-z0-9\-._~:\/?#\[\]@!$&*+,;=%() ]*$/) ? v : d;
+	};
+
+	const c_primary   = color('primary', '#5b7cfa');
+	const c_primary2  = color('primary2', '#8b5cf6');
+	const c_primary_d = color('primary_dark', '');
+	const n_blur      = num('blur', 22);
+	const n_radius    = num('radius', 18);
+	const n_glass     = num('glass', 62);
+	const n_blur_d    = num('blur_dark', 22);
+	const n_glass_d   = num('glass_dark', 62);
+	const n_dstart    = num('dark_start', 19);
+	const n_dend      = num('dark_end', 7);
+	const n_dim       = num('bg_dim', 0);
+	const s_dark      = safe('dark', 'auto');
+	const s_bg        = safe('bg_image', '');
+	const s_lbg       = safe('login_bg', '');
+	const s_owp       = safe('online_wallpaper', 'none');
+	const b_blobs     = (liuli_str(raw('blobs', '1')) == '1');
+	const b_chips     = (liuli_str(raw('chips', '1')) == '1');
+
+	const g1 = sprintf('%.2f', n_glass / 100);
+	const g2 = sprintf('%.2f', min(0.96, (n_glass + 16) / 100));
+	const g3 = sprintf('%.2f', max(0.10, (n_glass - 20) / 100));
+	const g1_d = sprintf('%.2f', n_glass_d / 100);
+	const g2_d = sprintf('%.2f', min(0.96, (n_glass_d + 16) / 100));
+	const g3_d = sprintf('%.2f', max(0.10, (n_glass_d - 20) / 100));
+
+	/* 登录页背景: 显式 URL 优先; 其次在线壁纸 (Bing 每日) */
+	const s_login_bg = (s_lbg != '') ? s_lbg
+		: (s_owp == 'bing') ? 'https://api.dujin.org/bing/1920.php' : '';
+
+	http.prepare_content('text/html; charset=UTF-8');
+-%}
+<!DOCTYPE html>
+<html lang="{{ dispatcher.lang }}">
+	<head>
+		<meta charset="utf-8">
+		<meta name="viewport" content="width=device-width, initial-scale=1">
+		<meta name="darkreader-lock">
+		<meta name="robots" content="noindex, nofollow">
+		<title>{{ hostname }}{{ node?.title ? ` - ${striptags(node.title)}` : '' }} - LuCI</title>
+		<script>window.LIULI_BOOT={n:{{ n_dstart }},e:{{ n_dend }},f:'{{ s_dark }}'};</script>
+		<script src="{{ resource }}/liuli-boot.js"></script>
+		<link rel="stylesheet" href="{{ media }}/css/cascade.css">
+		<link rel="icon" type="image/svg+xml" href="{{ media }}/img/favicon.svg">
+		<style id="liuli-custom">
+			:root {
+				--liuli-primary: {{ c_primary }};
+				--liuli-primary-2: {{ c_primary2 }};
+				--liuli-blur: blur({{ n_blur }}px) saturate(1.55);
+				--liuli-radius: {{ n_radius }}px;
+				--liuli-radius-sm: {{ int(n_radius * 0.68) }}px;
+				--liuli-glass: rgba(255, 255, 255, {{ g1 }});
+				--liuli-glass-strong: rgba(255, 255, 255, {{ g2 }});
+				--liuli-glass-soft: rgba(255, 255, 255, {{ g3 }});
+			}
+		:root[data-liuli-theme="dark"] {
+			--liuli-glass: rgba(23, 29, 45, {{ g1_d }});
+			--liuli-glass-strong: rgba(27, 34, 53, {{ g2_d }});
+			--liuli-glass-soft: rgba(30, 38, 58, {{ g3_d }});
+			--liuli-blur: blur({{ n_blur_d }}px) saturate(1.55);
+			{% if (c_primary_d != ''): %}
+			--liuli-primary: {{ c_primary_d }};
+			--liuli-primary-2: {{ c_primary_d }};
+			{% endif %}
+		}
+			{% if (n_dim > 0): %}
+			.liuli-bg::before {
+				content: "";
+				position: absolute; inset: 0; z-index: 1;
+				background: rgba(8, 12, 22, {{ sprintf('%.2f', n_dim / 100) }});
+			}
+			{% endif %}
+			{% if (!b_blobs): %}
+			.liuli-bg .blob { display: none; }
+			{% endif %}
+			{% if (!b_chips): %}
+			.liuli-topbar .liuli-chips { display: none; }
+			{% endif %}
+		</style>
+		{% if (node?.css): %}
+		<link rel="stylesheet" href="{{ resource }}/{{ node.css }}">
+		{% endif %}
+		{% if (css): %}
+		<style title="text/css">{{ css }}</style>
+		{% endif %}
+		<script src="{{ dispatcher.build_url('admin/translations', dispatcher.lang) }}"></script>
+		<script src="{{ resource }}/cbi.js"></script>
+		<script src="{{ resource }}/liuli-theme.js"></script>
+	</head>

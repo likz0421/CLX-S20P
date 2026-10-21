@@ -1,0 +1,257 @@
+#!/bin/bash
+#
+# CLX-S20P — ImmortalWrt 25.12 (mtk k6.12) DIY part1
+#
+# 做什么:
+#   1. 追加 Lucky 所需 feeds(nas / nas_luci / istore)
+#   2. 把仓库内自带的「琉璃 Liuli 主题 + 琉璃看板」拷进编译树
+#   3. 灌入 Lucky: 官方 luci-app-lucky v3.3.3 + 预编译静态核心 Makefile
+#   4. 更新并安装 feeds
+#   5. 【崩溃守卫】扫描所有 .ut 模板, 禁止调用 ucode 里不存在的函数
+#   6. 把镜像默认主题改为琉璃
+#
+# 关于第 5 条 —— 这是真·根因防线:
+#   刷机后 LuCI 打不开, 报
+#       Unhandled exception during request dispatching /
+#       left-hand side is not a function
+#       (runtime.uc:133 <- dispatcher.uc:960)
+#   根因是 ucode 的全局函数表里**没有 String()**
+#   (jow-/ucode 的 lib.c 只注册了 71 个内置: chr/die/int/sprintf/min/max/uniq/
+#    match/... 全部没有 String)。模板里调用 String(x) 等于调用 undefined,
+#   直接抛 "left-hand side is not a function"; 而 sysauth 的渲染同时被
+#   dispatcher.uc:953(主题 sysauth) 和 :960(base sysauth 回退) 两条路走到,
+#   两条都炸, 整个 LuCI 就 500 了。
+#
+#   注意: 此前误判为 getspnam。取证结果推翻了它 ——
+#   /usr/lib/ucode/luci/core.so 在「可用固件」和「崩溃固件」里字符串表
+#   完全一致(137 条, 零差异), getspnam 两边都导出了。
+#   getspnam 守卫保留为纵深防御, 但不再是主防线。
+#
+set -eo pipefail
+
+echo "==================== diy-part1: 开始 ===================="
+
+# ---------------------------------------------------------
+# 1. feeds
+# ---------------------------------------------------------
+touch feeds.conf.default
+grep -q "nas-packages.git" feeds.conf.default \
+  || echo 'src-git nas https://github.com/linkease/nas-packages.git;master' >> feeds.conf.default
+grep -q "nas-packages-luci" feeds.conf.default \
+  || echo 'src-git nas_luci https://github.com/linkease/nas-packages-luci.git;main' >> feeds.conf.default
+grep -q "istore" feeds.conf.default \
+  || echo 'src-git istore https://github.com/linkease/istore;main' >> feeds.conf.default
+
+mkdir -p package/custom
+
+# ---------------------------------------------------------
+# 2. 琉璃 Liuli 主题 + 琉璃看板
+# ---------------------------------------------------------
+mkdir -p package/custom/liuli-theme package/custom/luci-app-liuli
+cp -r "$GITHUB_WORKSPACE/luci-theme-liuli/." package/custom/liuli-theme/
+cp -r "$GITHUB_WORKSPACE/luci-app-liuli/."  package/custom/luci-app-liuli/
+
+# 拷贝失败必须立刻失败: 否则 CONFIG_PACKAGE_luci-theme-liuli=y 会被 oldconfig
+# 静默丢掉, 最后编出一个"没有琉璃主题"的固件且全程绿灯
+[ -f package/custom/liuli-theme/Makefile ]   || { echo "::error::liuli 主题拷贝失败"; exit 1; }
+[ -f package/custom/luci-app-liuli/Makefile ] || { echo "::error::liuli 看板拷贝失败"; exit 1; }
+echo "琉璃 Liuli 已加入编译树:"
+ls package/custom/liuli-theme package/custom/luci-app-liuli
+
+# ---------------------------------------------------------
+# 3. Lucky: 官方 luci-app-lucky v3.3.3
+#    核心 lucky 包用 release.66666.host 官方 3.3.3 xiaojv 预编译静态二进制
+# ---------------------------------------------------------
+git clone --depth=1 -b v3.3.3 https://github.com/gdy666/luci-app-lucky.git package/custom/lucky-app
+
+cat > package/custom/lucky-app/lucky/Makefile <<'LUCKY_EOF'
+# SPDX-License-Identifier: MIT
+# Lucky core - official prebuilt static binary (3.3.3 xiaojv)
+
+include $(TOPDIR)/rules.mk
+
+PKG_NAME:=lucky
+PKG_VERSION:=3.3.3
+PKG_RELEASE:=1
+
+PKG_LICENSE:=MIT
+PKG_LICENSE_FILES:=LICENSE
+PKG_MAINTAINER:=GDY666 <gdy666@foxmail.com>
+
+LUCKY_ARCH:=
+
+ifeq ($(ARCH),aarch64)
+  LUCKY_ARCH:=arm64
+endif
+ifeq ($(ARCH),x86_64)
+  LUCKY_ARCH:=x86_64
+endif
+
+PKG_SOURCE:=lucky_$(PKG_VERSION)_Linux_$(LUCKY_ARCH)_xiaojv.tar.gz
+PKG_SOURCE_URL:=https://release.66666.host/v3.3.3beta/3.3.3_xiaojv/
+PKG_HASH:=a0ff1fa14a08fa9b3aefc36644ebfcfa0be93a726abc28185aa3553b04af3b58
+PKG_BUILD_DIR:=$(BUILD_DIR)/$(PKG_NAME)-$(PKG_VERSION)
+
+include $(INCLUDE_DIR)/package.mk
+
+define Package/lucky
+  SECTION:=net
+  CATEGORY:=Network
+  TITLE:=Lucky network utility (official prebuilt 3.3.3 xiaojv)
+  DEPENDS:=@(aarch64||x86_64)
+  URL:=https://lucky666.cn
+endef
+
+define Package/lucky/description
+ Lucky provides IPv4/IPv6 port forwarding, DDNS, Wake-on-LAN,
+ reverse proxy, ACME automation and related network services.
+ Prebuilt static binary from the official release server.
+endef
+
+define Package/lucky/conffiles
+/etc/config/lucky
+endef
+
+define Build/Prepare
+	$(INSTALL_DIR) $(PKG_BUILD_DIR)
+	gzip -dc $(DL_DIR)/$(PKG_SOURCE) | $(HOST_TAR) -C $(PKG_BUILD_DIR) -xf -
+	$(Build/Patch)
+endef
+
+define Build/Compile
+endef
+
+define Package/lucky/install
+	$(INSTALL_DIR) $(1)/usr/bin
+	$(INSTALL_BIN) $(PKG_BUILD_DIR)/lucky $(1)/usr/bin/lucky
+	$(INSTALL_DIR) $(1)/usr/libexec
+	$(INSTALL_BIN) ./files/lucky-call $(1)/usr/libexec/lucky-call
+	$(INSTALL_BIN) ./files/lucky-watchdog $(1)/usr/libexec/lucky-watchdog
+	$(INSTALL_DIR) $(1)/usr/share/lucky
+	echo '$(LUCKY_ARCH)' > $(1)/usr/share/lucky/arch
+	$(INSTALL_DIR) $(1)/etc/init.d
+	$(INSTALL_BIN) ./files/lucky.init $(1)/etc/init.d/lucky
+	$(INSTALL_DIR) $(1)/etc/config
+	$(INSTALL_CONF) ./files/luckyuci $(1)/etc/config/lucky
+endef
+
+define Package/lucky/postinst
+#!/bin/sh
+[ -n "$${IPKG_INSTROOT}" ] || /usr/libexec/lucky-watchdog sync
+endef
+
+define Package/lucky/prerm
+#!/bin/sh
+if [ -z "$${IPKG_INSTROOT}" ] && [ "$${PKG_UPGRADE}" != 1 ]; then
+	/etc/init.d/lucky stop
+	/usr/libexec/lucky-watchdog remove
+fi
+endef
+
+$(eval $(call BuildPackage,lucky))
+LUCKY_EOF
+echo "Lucky 已加入编译树"
+
+# ---------------------------------------------------------
+# 4. feeds 更新 + 安装
+# ---------------------------------------------------------
+./scripts/feeds update -a
+./scripts/feeds install -a
+
+# ---------------------------------------------------------
+# 5. 崩溃守卫 + 默认主题
+# ---------------------------------------------------------
+python3 <<'GUARD_PYEOF'
+import os
+import re
+import sys
+
+ROOTS = ["feeds/luci", "package/custom"]
+fails = []
+
+# ---- 5a. 禁止调用 ucode 里不存在的函数 (JS 惯性写法) ----
+# ucode 全局函数表只有 71 个, 没有 String()/Number()/Boolean() 这类 JS 构造器,
+# 也没有 JSON.parse/JSON.stringify(ucode 用 json())。
+BANNED = [
+    (r"(?<![\w$.])String\s*\(",      "String()  — ucode 没有该全局函数, 用模板字面量 `${x}` 代替"),
+    (r"(?<![\w$.])Number\s*\(",      "Number()  — ucode 没有该全局函数, 用 int()/float 运算代替"),
+    (r"(?<![\w$.])Boolean\s*\(",     "Boolean() — ucode 没有该全局函数, 用 !!x 代替"),
+    (r"(?<![\w$.])Array\.isArray",   "Array.isArray — ucode 没有该 API, 用 type(x) == 'array'"),
+    (r"(?<![\w$.])JSON\.(parse|stringify)", "JSON.* — ucode 用 json() 编解码"),
+]
+
+CODE_SPAN = re.compile(r"\{%(-?)(.*?)(-?)%\}|\{\{(.*?)\}\}", re.S)
+
+scanned = 0
+for root in ROOTS:
+    if not os.path.isdir(root):
+        continue
+    for dirpath, _, files in os.walk(root):
+        for fn in files:
+            if not fn.endswith(".ut"):
+                continue
+            p = os.path.join(dirpath, fn)
+            try:
+                src = open(p, encoding="utf-8").read()
+            except Exception:
+                continue
+            scanned += 1
+            # 只看 ucode 代码块, 避免误伤 CSS 里的 rgba()/blur()/url()
+            code = "\n".join(
+                (m.group(2) or "") + "\n" + (m.group(4) or "")
+                for m in CODE_SPAN.finditer(src)
+            )
+            for pat, why in BANNED:
+                m = re.search(pat, code)
+                if m:
+                    line = code.count("\n", 0, m.start()) + 1
+                    fails.append(f"{p}: 命中 {why}")
+
+print("=" * 66)
+print(f"崩溃守卫: 扫描 {scanned} 个 .ut 模板")
+print("=" * 66)
+if fails:
+    print("::error::以下模板调用了 ucode 中不存在的函数, 会导致 LuCI 500:")
+    for f in fails:
+        print("   ", f)
+    sys.exit(1)
+print("  通过: 无 String()/Number()/JSON.* 等 ucode 未注册调用")
+
+# ---- 5b. getspnam 纵深防御(曾误判为主因, 保留以防换 luci 版本复发) ----
+OLD = "{% if (getuid() == 0 && getspnam('root')?.pwdp === ''): %}"
+NEW = ("{% if (type(getuid) == 'function' && getuid() == 0 "
+       "&& type(getspnam) == 'function' && (getspnam('root')?.pwdp ?? '') === ''): %}")
+patched = []
+for root in ROOTS:
+    if not os.path.isdir(root):
+        continue
+    for dirpath, _, files in os.walk(root):
+        for fn in files:
+            if not fn.endswith(".ut"):
+                continue
+            p = os.path.join(dirpath, fn)
+            try:
+                s = open(p, encoding="utf-8").read()
+            except Exception:
+                continue
+            if OLD in s:
+                open(p, "w", encoding="utf-8").write(s.replace(OLD, NEW))
+                patched.append(p)
+print(f"getspnam 守卫: 修补 {len(patched)} 个模板")
+for p in patched:
+    print("   patched:", p)
+
+# ---- 5c. 镜像默认主题改为琉璃 ----
+cfg = "feeds/luci/modules/luci-base/root/etc/config/luci"
+if os.path.isfile(cfg):
+    s = open(cfg, encoding="utf-8").read()
+    s2 = re.sub(r"option mediaurlbase\s+\S+",
+                "option mediaurlbase /luci-static/liuli", s)
+    open(cfg, "w", encoding="utf-8").write(s2)
+    print("默认主题 ->", [l for l in s2.splitlines() if "mediaurlbase" in l])
+else:
+    print("::warning:: 未找到默认主题配置:", cfg)
+GUARD_PYEOF
+
+echo "自检通过: 无 ucode 未注册函数调用"
+echo "==================== diy-part1: 完成 ===================="

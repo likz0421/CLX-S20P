@@ -1,0 +1,321 @@
+name: CLX-S20P 25.12 (mtk-k6.12)
+
+env:
+  DEVICE_NAME: clx_s20p
+  REPO_URL: https://github.com/chasey-dev/immortalwrt-mt798x-rebase
+  REPO_BRANCH: 25.12
+  CONFIG_FILE: 25.12/s20p.config
+  DIY_P1_SH: 25.12/diy-part1.sh
+  DIY_P2_SH: 25.12/diy-part2.sh
+  UPLOAD_BIN_DIR: false
+  UPLOAD_FIRMWARE: true
+  UPLOAD_RELEASE: true
+  TZ: Asia/Shanghai
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+on:
+  repository_dispatch:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+
+    steps:
+    # =========================================================
+    # 1. 释放磁盘空间 + 安装编译依赖
+    # =========================================================
+    - name: Free disk space
+      run: |
+        sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+          /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/lib/jvm
+        sudo docker image prune --all --force
+        df -hT
+
+    - name: Install build dependencies
+      env:
+        DEBIAN_FRONTEND: noninteractive
+      run: |
+        sudo apt-get update -qq
+        sudo apt-get install -y --no-install-recommends \
+          ack antlr3 asciidoc autoconf automake autopoint binutils bison build-essential \
+          bzip2 ccache clang cmake cpio curl device-tree-compiler ecj fastjar flex gawk \
+          gettext git gperf haveged help2man intltool lib32gcc-s1 libc6-dev-i386 \
+          libelf-dev libglib2.0-dev libgmp3-dev libltdl-dev libmpc-dev libmpfr-dev \
+          libncurses-dev libpython3-dev libreadline-dev libssl-dev libtool libyaml-dev \
+          libz-dev lrzsz mkisofs msmtp nano ninja-build p7zip p7zip-full patch pkgconf \
+          python3 python3-pip python3-ply python3-docutils python3-pyelftools qemu-utils \
+          re2c rsync scons squashfs-tools subversion swig texinfo uglifyjs upx-ucl unzip \
+          vim wget xmlto xxd zlib1g-dev zstd
+        sudo apt-get clean
+        python3 -m pip install --break-system-packages PySquashfsImage
+
+    # =========================================================
+    # 2. 签出本仓库(含 liuli 主题/看板源码)
+    # =========================================================
+    - name: Checkout
+      uses: actions/checkout@v5
+
+    - name: Show workspace
+      run: |
+        ls -la "$GITHUB_WORKSPACE"
+        echo "liuli 主题模板:"
+        ls -la "$GITHUB_WORKSPACE/luci-theme-liuli/ucode/template/themes/liuli/"
+
+    # =========================================================
+    # 3. 克隆 ImmortalWrt 25.12 源码
+    # =========================================================
+    - name: Clone source code
+      run: |
+        df -hT
+        git clone "$REPO_URL" -b "$REPO_BRANCH" --single-branch --depth=1 openwrt
+        cd openwrt
+        echo "源码 HEAD: $(git rev-parse --short HEAD)"
+        echo "上游提交: $(git log -1 --format='%ad %s' --date=short)"
+
+    # =========================================================
+    # 4. diy-part1: feeds + liuli + lucky + 崩溃守卫
+    # =========================================================
+    - name: Load custom feeds (diy-part1.sh)
+      run: |
+        cd openwrt
+        chmod +x "$GITHUB_WORKSPACE/$DIY_P1_SH"
+        "$GITHUB_WORKSPACE/$DIY_P1_SH"
+
+    # =========================================================
+    # 5. diy-part2: 配置定型 + 硬校验
+    # =========================================================
+    - name: Load custom configuration (diy-part2.sh)
+      run: |
+        cd openwrt
+        [ -e "$GITHUB_WORKSPACE/$CONFIG_FILE" ] && cp "$GITHUB_WORKSPACE/$CONFIG_FILE" .config
+        chmod +x "$GITHUB_WORKSPACE/$DIY_P2_SH"
+        "$GITHUB_WORKSPACE/$DIY_P2_SH"
+
+    # =========================================================
+    # 6. 下载源码包
+    # =========================================================
+    - name: Download package sources
+      run: |
+        cd openwrt
+        make download -j$(nproc)
+        find dl -size -1024c -exec ls -l {} \;
+        find dl -size -1024c -exec rm -f {} \;
+
+    # =========================================================
+    # 7. 编译
+    # =========================================================
+    - name: Compile firmware
+      id: compile
+      run: |
+        cd openwrt
+        echo "可用线程: $(nproc)"
+        # 并行失败时用单线程重试定位真实错误; 两次都失败必须让步骤红掉,
+        # 绝不能让 echo 吃掉退出码
+        if make -j$(nproc) V=s; then
+          echo "首次并行编译成功"
+        elif make -j1 V=s; then
+          echo "单线程重试编译成功"
+        else
+          echo "::error::编译失败 (并行与单线程均失败)"
+          exit 1
+        fi
+        echo "status=success" >> $GITHUB_OUTPUT
+
+    # =========================================================
+    # 8. ★ 出厂固件取证验证 ★
+    #    不信任"编译成功", 直接把 rootfs 拆开逐条核对。
+    #    这是唯一能证明"改动真的进固件了"的手段。
+    # =========================================================
+    - name: Verify built firmware (rootfs forensics)
+      run: |
+        cd openwrt
+        set -eo pipefail
+        BIN=$(find bin/targets/mediatek/filogic -name "*clx_s20p-squashfs-sysupgrade.bin" | head -1)
+        if [ -z "$BIN" ]; then
+          echo "::error::未找到 sysupgrade 固件"
+          find bin/targets -maxdepth 2 -type f | head -20
+          exit 1
+        fi
+        echo "待验证固件: $BIN  ($(stat -c%s "$BIN") bytes)"
+        python3 - "$BIN" <<'VERIFY_PYEOF'
+        import io, re, sys
+        from PySquashfsImage import SquashFsImage
+
+        BIN = sys.argv[1]
+        blob = open(BIN, "rb").read()
+        off = blob.find(b"hsqs")
+        assert off >= 0, "no hsqs magic"
+        print(f"[*] hsqs @ {off}, image {len(blob)} bytes")
+        img = SquashFsImage(io.BytesIO(blob[off:]))
+
+        def walk(n):
+            try:
+                items = list(n.iterdir())
+            except Exception:
+                return
+            for c in items:
+                try:
+                    if c.is_dir:
+                        yield from walk(c)
+                    else:
+                        yield c
+                except Exception:
+                    continue
+
+        files = {}
+        for c in walk(img.root):
+            p = getattr(c, "path", None) or c.name
+            files["/" + p.lstrip("/")] = c
+        print(f"[*] indexed {len(files)} files")
+
+        def rd(path):
+            n = files.get(path)
+            if n is None:
+                return None
+            for m in (lambda: n.read_text(), lambda: img.read_file(n.inode)):
+                try:
+                    d = m()
+                    return d.decode("utf-8", "replace") if isinstance(d, (bytes, bytearray)) else d
+                except Exception:
+                    continue
+            return None
+
+        failures = []
+
+        # ---- 检查 1: 出厂模板里不能有 ucode 未注册函数调用 ----
+        SPAN = re.compile(r"\{%(-?)(.*?)(-?)%\}|\{\{(.*?)\}\}", re.S)
+        BANNED = [
+            (r"(?<![\w$.])String\s*\(", "String()"),
+            (r"(?<![\w$.])Number\s*\(", "Number()"),
+            (r"(?<![\w$.])JSON\.(parse|stringify)", "JSON.*"),
+        ]
+        scanned = hits = 0
+        for p in sorted(files):
+            if not p.endswith(".ut"):
+                continue
+            d = rd(p)
+            if not d:
+                continue
+            scanned += 1
+            code = "\n".join((m.group(2) or "") + "\n" + (m.group(4) or "")
+                             for m in SPAN.finditer(d))
+            for pat, name in BANNED:
+                if re.search(pat, code):
+                    hits += 1
+                    failures.append(f"{p} 含 ucode 未注册调用 {name}")
+        print(f"[check1] 扫描 {scanned} 个模板, 违规 {hits}")
+        if hits:
+            for f in failures:
+                print("   !!", f)
+
+        # ---- 检查 2: 默认主题必须是琉璃 ----
+        cfg = rd("/etc/config/luci") or ""
+        m = re.search(r"option\s+mediaurlbase\s+(\S+)", cfg)
+        media = m.group(1) if m else "(none)"
+        print(f"[check2] 默认主题 mediaurlbase = {media}")
+        if "liuli" not in media:
+            failures.append(f"默认主题不是琉璃: {media}")
+
+        # ---- 检查 3: liuli 模板必须齐全 ----
+        need = ["footer.ut", "head.ut", "header.ut", "sysauth.ut"]
+        for n in need:
+            p = f"/usr/share/ucode/luci/template/themes/liuli/{n}"
+            ok = p in files
+            print(f"[check3] {p}: {'OK' if ok else 'MISSING'}")
+            if not ok:
+                failures.append(f"缺少琉璃模板 {n}")
+
+        # ---- 检查 4: liuli 静态资源 + lucky 二进制 ----
+        for p, label in [
+            ("/www/luci-static/liuli/css/cascade.css", "琉璃 CSS"),
+            ("/usr/bin/lucky", "lucky 核心二进制"),
+        ]:
+            ok = p in files
+            print(f"[check4] {label} {p}: {'OK' if ok else 'MISSING'}")
+            if not ok:
+                failures.append(f"缺少 {label} ({p})")
+
+        # ---- 检查 5: 琉璃主题必须已修复(不含裸 String) ----
+        hdr = rd("/usr/share/ucode/luci/template/themes/liuli/head.ut") or ""
+        print(f"[check5] liuli/head.ut: {len(hdr)} chars, "
+              f"liuli_str helper = {'liuli_str' in hdr}, 裸 String( = {bool(re.search(r'(?<![\w$.])String\s*\(', hdr))}")
+
+        print("\n" + "=" * 62)
+        if failures:
+            print("::error::出厂固件验证失败:")
+            for f in failures:
+                print("   -", f)
+            sys.exit(1)
+        print("出厂固件验证全部通过 ✓")
+        print("=" * 62)
+        VERIFY_PYEOF
+
+    # =========================================================
+    # 9. 整理 & 上传产物
+    # =========================================================
+    - name: Organize firmware files
+      id: organize
+      run: |
+        cd openwrt/bin/targets/mediatek/filogic
+        rm -rf packages
+        DATE=$(date +%Y%m%d)
+        for f in *clx_s20p*; do
+          [ -e "$f" ] || continue
+          case "$f" in
+            *sysupgrade.bin) mv "$f" "s20p-v25.12-${DATE}-sysupgrade.bin" ;;
+            *initramfs-kernel.bin) mv "$f" "s20p-v25.12-${DATE}-initramfs-kernel.bin" ;;
+          esac
+        done
+        sha256sum * > sha256sums 2>/dev/null || true
+        cp .config ../../../../config.buildinfo 2>/dev/null || true
+        echo "PACKAGE_DATE=${DATE}" >> $GITHUB_OUTPUT
+        echo "-------------------- 产物 --------------------"
+        ls -la
+        cd ../../../.. && ls -la *.buildinfo 2>/dev/null || true
+
+    - name: Upload firmware to artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: clx-s20p-25.12-${{ steps.organize.outputs.PACKAGE_DATE }}
+        path: openwrt/bin/targets/mediatek/filogic/
+
+    - name: Upload config.buildinfo
+      uses: actions/upload-artifact@v4
+      with:
+        name: clx-s20p-25.12-buildinfo
+        path: openwrt/config.buildinfo
+
+    # =========================================================
+    # 10. 发布 Release
+    # =========================================================
+    - name: Generate release tag
+      id: tag
+      run: |
+        echo "release_tag=$(date +"%Y%m%d")" >> $GITHUB_OUTPUT
+        echo "release_date=$(date +"%Y.%m.%d")" >> $GITHUB_OUTPUT
+
+    - name: Upload firmware to release
+      uses: softprops/action-gh-release@v2.3.2
+      with:
+        tag_name: ${{ steps.tag.outputs.release_tag }}
+        name: CLX-S20P v25.12-mtk-k6.12 (${{ steps.tag.outputs.release_date }})
+        body: |
+          ## CLX-S20P — ImmortalWrt 25.12 (mtk k6.12)
+
+          - 源码: `${{ env.REPO_URL }}` 分支 `${{ env.REPO_BRANCH }}`
+          - 设备: `mediatek/filogic · clx_s20p · aarch64_cortex-a53`
+          - 自带: 琉璃 Liuli 主题(默认) + 琉璃看板 + Lucky
+
+          ### 本次修复
+          - 修复 LuCI 登录页 500 (`left-hand side is not a function`):
+            ucode 全局函数表里没有 `String()`, 琉璃模板调用它即崩溃。
+            已改为模板字面量 `liuli_str()` helper, 并在构建期加了守卫。
+        files: |
+          openwrt/bin/targets/mediatek/filogic/*
+          openwrt/config.buildinfo

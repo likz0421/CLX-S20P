@@ -1,0 +1,12 @@
+{
+	"luci-app-liuli": {
+		"description": "Grant access to Liuli router dashboard",
+		"read": {
+			"ubus": {
+				"luci.liuli": [ "getDevices", "getSystem", "getLog", "ping" ],
+				"luci-rpc": [ "getWirelessDevices" ],
+				"iwinfo": [ "assoclist" ]
+			}
+		}
+	}
+}

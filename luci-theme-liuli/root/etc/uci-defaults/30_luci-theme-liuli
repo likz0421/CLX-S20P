@@ -1,0 +1,10 @@
+#!/bin/sh
+# 琉璃 Liuli theme activation (fresh install only, keeps upgrade-time choice)
+
+[ "${PKG_UPGRADE}" = "1" ] && exit 0
+
+uci -q get luci.themes.Liuli >/dev/null 2>&1 || uci set luci.themes.Liuli=/luci-static/liuli
+uci set luci.main.mediaurlbase=/luci-static/liuli
+uci commit luci
+
+exit 0

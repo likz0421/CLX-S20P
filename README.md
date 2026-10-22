@@ -161,3 +161,69 @@ for node in img.root.iterdir():                 # 递归遍历
 
 工作流还有一个「出厂固件取证验证」步骤：编译完成后把 rootfs 拆开，
 逐条核对「模板无违规调用 + 默认主题是琉璃 + liuli 模板齐全 + lucky 二进制存在」。
+
+---
+
+## 第二轮全量审计（2026-10-22）—— 同一个病在 rpcd 后端复发
+
+第一轮修的是 `.ut` 模板里的 `String()`。第二轮把 `root/usr/share/rpcd/ucode/`
+下的脚本也审了一遍，发现**同一个根因又中了一次**，而且症状更糟：
+
+| # | 文件 | 问题 | 后果 |
+|---|------|------|------|
+| B1 | `luci.liuli` ×4 | `String(s ?? '')` | `num()`/`logEntries()`/`shellquote()` 崩溃 |
+| B2 | `luci.liuli` ×1 | `unixtime()` | `ping` 方法崩溃 |
+| B3 | `luci.liuli` | `int("abc")` 返回 **NaN** 而非 `null` | NaN 泄进 `mountPoints`/`processes`/`conntrack` |
+| B4 | `luci.liuli` | `"abc" * 1` 返回 **NaN** 而非 `null` | `toNum()` 把 NaN 当有效时延 |
+| B5 | `luci.liuli` | 进程表硬编码 `f[6]` 当 %CPU | busybox top 第 6 列是 **%MEM** |
+| B6 | `luci.liuli` | `awk ... 100 - $8` 取 idle | busybox 若不带 `nic` 指标即错位 |
+| B7 | `luci.liuli` | `logread -l ' + count` 直接拼前端入参 | 命令注入面 |
+| B8 | `luci.liuli` | 每个无线接口各建一条 ubus 连接 | socket 数随接口数线性增长 |
+
+四个 dashboard 方法里，`getDevices` 侥幸能跑，`getSystem` / `getLog` / `ping`
+**全部崩溃**—— 而旧的构建守卫只扫 `.ut` 模板，完全看不到 rpcd 脚本，
+这就是它漏掉的原因。
+
+### 怎么证实「`String` / `unixtime` 真的不存在」
+
+不靠猜，三条独立证据互相印证：
+
+1. **源码**：`jow-/ucode`（现 `ucode-lang/ucode`）`lib/lib.c` 的
+   `uc_stdlib_functions[]` 表，71 项，`String` / `unixtime` 均不在内。
+2. **出厂二进制**：OpenWrt 剥掉了 ELF section header（`e_shoff == 0`），
+   `.symtab` 也没了，但可以用 program headers 定位 `.data.rel.ro`，
+   按 `uc_function_list_t { const char *name; fn }` 的 16 字节 stride
+   把整张表读出来 —— 71 项，与源码逐一吻合。
+   `strings` 不能用来做这个判定：GCC 会合并字面量（`length` 藏在
+   `ucv_string_new_length` 里 → 假阴性），而词法分析器的 token 名
+   `String` 又会造成假阳性。
+3. **正向对照**：同一把 stride-16 扫描器跑 `luci/core.so`，抓到了
+   `getspnam` / `getuid` / `statvfs` / `uname` / `crypt` / `kill`
+   —— 证明方法确实能检出已注册函数，而不是只会返回空。
+
+### 顺带查清的两件事
+
+- `'%1024.1m'.format(x)` **是对的**：LuCI `cbi.js` 的
+  `String.prototype.format` 把 `%` 后的 `(\d+)` 当除数、`(\.\d+)` 当小数位，
+  `m` 类型再套一层 1024 进制单位。看着像乱码，实际是合法的。
+- `list.sort((a, b) => ...)` **是对的**：ucode 的 `uc_sort` 第二个参数
+  就是比较器（`uc_fn_arg(1)` → `array_sort_fn` → `uc_vm_call`）。
+- ACL 组名用包名（`luci-app-liuli`）**是有效的**：rpcd
+  `rpc_login_test_permission()` 用 `fnmatch(list_entry, group)`，
+  而出厂 `/etc/config/rpcd` 默认就是 `list read '*'` / `list write '*'`，
+  所以 root 会话拿到全部 ACL 组。
+
+### 防复发（已加固）
+
+- `diy-part1.sh` 崩溃守卫现在扫三类 ucode 源码：`.ut` 模板 +
+  `.uc` 控制器 + `root/usr/share/rpcd/ucode/*`；规则表从 5 条扩到 11 条
+  （新增 `unixtime()` / `parseInt()` / `parseFloat()` / `Object.*` /
+  `Date.now` / `Math.*`），并且**先剥注释再扫描**——之前守卫扫到自己
+  写在 `{% %}` 块里的说明注释，直接让构建 `exit 1`。
+- 规则表对出厂固件自带的 59 个 ucode 文件做过假阳性对照：除
+  `luci.liuli` 自身外零命中。
+- 守卫自带正/负向自测（`_verify/guard_test.py`）：bug 版必须 `exit 1`
+  并点名行号，修复版必须 `exit 0`。
+- 出厂固件复验器收进仓库成为**唯一事实源**：
+  `25.12/verify-firmware.py`，CI 的「Verify built firmware」步骤直接跑它，
+  本地 `_verify/verify.py` 也是它，两边规则不可能再漂移。

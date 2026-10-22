@@ -7,7 +7,8 @@
 #   2. 把仓库内自带的「琉璃 Liuli 主题 + 琉璃看板」拷进编译树
 #   3. 灌入 Lucky: 官方 luci-app-lucky v3.3.3 + 预编译静态核心 Makefile
 #   4. 更新并安装 feeds
-#   5. 【崩溃守卫】扫描所有 .ut 模板, 禁止调用 ucode 里不存在的函数
+#   5. 【崩溃守卫】扫描所有 ucode 源码 (.ut 模板 + .uc 控制器 + rpcd 脚本),
+#      禁止调用 ucode 里不存在的函数
 #   6. 把镜像默认主题改为琉璃
 #
 # 关于第 5 条 —— 这是真·根因防线:
@@ -17,10 +18,15 @@
 #       (runtime.uc:133 <- dispatcher.uc:960)
 #   根因是 ucode 的全局函数表里**没有 String()**
 #   (jow-/ucode 的 lib.c 只注册了 71 个内置: chr/die/int/sprintf/min/max/uniq/
-#    match/... 全部没有 String)。模板里调用 String(x) 等于调用 undefined,
+#    match/... 全部没有 String)。调用 String(x) 等于调用 undefined,
 #   直接抛 "left-hand side is not a function"; 而 sysauth 的渲染同时被
 #   dispatcher.uc:953(主题 sysauth) 和 :960(base sysauth 回退) 两条路走到,
 #   两条都炸, 整个 LuCI 就 500 了。
+#
+#   第二轮审计又发现同一个病在 rpcd 后端复发: luci.liuli 里有 4 处 String()
+#   和 1 处 unixtime(), 让 getSystem/getLog/ping 三个 ubus 方法全部崩溃。
+#   旧守卫只扫 .ut 模板, 完全看不到 root/usr/share/rpcd/ucode/ 下的脚本 ——
+#   这就是它漏掉的原因。现在守卫覆盖三类 ucode 源码。
 #
 #   注意: 此前误判为 getspnam。取证结果推翻了它 ——
 #   /usr/lib/ucode/luci/core.so 在「可用固件」和「崩溃固件」里字符串表
@@ -171,51 +177,150 @@ fails = []
 
 # ---- 5a. 禁止调用 ucode 里不存在的函数 (JS 惯性写法) ----
 # ucode 全局函数表只有 71 个, 没有 String()/Number()/Boolean() 这类 JS 构造器,
-# 也没有 JSON.parse/JSON.stringify(ucode 用 json())。
+# 也没有 JSON.parse/JSON.stringify(ucode 用 json()), 更没有 parseInt/parseFloat/
+# unixtime()/Date.now()/Math.*。这些名字在 ucode 里调用即抛
+# "left-hand side is not a function"。
+#
+# 下面这份规则表对出厂固件自带的 59 个 ucode 文件 (.ut/.uc/rpcd 脚本) 做过
+# 假阳性对照: 除 luci.liuli 自身外零命中, 所以不会误伤上游代码。
 BANNED = [
     (r"(?<![\w$.])String\s*\(",      "String()  — ucode 没有该全局函数, 用模板字面量 `${x}` 代替"),
-    (r"(?<![\w$.])Number\s*\(",      "Number()  — ucode 没有该全局函数, 用 int()/float 运算代替"),
+    (r"(?<![\w$.])Number\s*\(",      "Number()  — ucode 没有该全局函数, 用 int()/乘法运算代替"),
     (r"(?<![\w$.])Boolean\s*\(",     "Boolean() — ucode 没有该全局函数, 用 !!x 代替"),
     (r"(?<![\w$.])Array\.isArray",   "Array.isArray — ucode 没有该 API, 用 type(x) == 'array'"),
     (r"(?<![\w$.])JSON\.(parse|stringify)", "JSON.* — ucode 用 json() 编解码"),
+    (r"(?<![\w$.])unixtime\s*\(",    "unixtime() — ucode 没有该全局函数, 用 time() 取 Unix 时间戳"),
+    (r"(?<![\w$.])parseInt\s*\(",    "parseInt() — ucode 没有该全局函数, 用 int()"),
+    (r"(?<![\w$.])parseFloat\s*\(",  "parseFloat() — ucode 没有该全局函数, 用 `s * 1`"),
+    (r"(?<![\w$.])Object\.(keys|values|entries|assign)", "Object.* — ucode 用 keys()/values()"),
+    (r"(?<![\w$.])Date\.now",        "Date.now — ucode 用 time()"),
+    (r"(?<![\w$.])Math\.(max|min|round|floor|abs|pow)", "Math.* — ucode 用 max()/min() 或算术"),
 ]
 
+# ucode 模板代码块: {% ... %} 与 {{ ... }}
 CODE_SPAN = re.compile(r"\{%(-?)(.*?)(-?)%\}|\{\{(.*?)\}\}", re.S)
 
-scanned = 0
+
+def strip_comments(s):
+    """剥掉 /* */ 与 // 注释, 保留字符串字面量内容。
+
+    必须先剥注释再扫描: 之前守卫扫到自己写在 {% %} 块里的说明注释
+    (注释里含字面量 String(), 直接让构建 exit 1)。
+    用逐字符扫描而不是正则, 因为 ucode 字符串可以嵌套
+    (双引号里出现单引号, 正则按顺序剥离会错位)。
+    """
+    out = []
+    i, n = 0, len(s)
+    while i < n:
+        c = s[i]
+        if c == "/" and i + 1 < n and s[i + 1] == "*":
+            j = s.find("*/", i + 2)
+            i = (j + 2) if j >= 0 else n
+            continue
+        if c == "/" and i + 1 < n and s[i + 1] == "/":
+            j = s.find("\n", i)
+            i = (j if j >= 0 else n)
+            continue
+        if c in "\"'`":
+            q = c
+            i += 1
+            while i < n:
+                if s[i] == "\\":
+                    i += 2
+                    continue
+                if s[i] == q:
+                    i += 1
+                    break
+                i += 1
+            out.append('""')
+            continue
+        if c == "/":
+            k = len(out) - 1
+            while k >= 0 and out[k].strip() == "":
+                k -= 1
+            prev = out[k][-1] if k >= 0 else ""
+            if prev in "(,=:[!&|?{;" or prev == "":
+                i += 1
+                incls = False
+                while i < n:
+                    if s[i] == "\\":
+                        i += 2
+                        continue
+                    if s[i] == "[":
+                        incls = True
+                    elif s[i] == "]":
+                        incls = False
+                    elif s[i] == "/" and not incls:
+                        i += 1
+                        while i < n and s[i].isalpha():
+                            i += 1
+                        break
+                    i += 1
+                out.append("RE")
+                continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def ucode_of(path, src):
+    """按文件类型取出「纯 ucode 代码」部分。
+
+    .ut  模板 -> 只取 {% %}/{{ }} 块, 避开 CSS 里的 blur()/rgba()/url()
+    .uc  控制器 -> 整个文件都是 ucode
+    无扩展名的 rpcd 脚本 (root/usr/share/rpcd/ucode/*) -> 整个文件都是 ucode
+    """
+    if path.endswith(".ut"):
+        return "\n".join(
+            (m.group(2) or "") + "\n" + (m.group(4) or "")
+            for m in CODE_SPAN.finditer(src)
+        )
+    return src
+
+
+stats = {".ut": 0, ".uc": 0, "rpcd": 0}
+
 for root in ROOTS:
     if not os.path.isdir(root):
         continue
     for dirpath, _, files in os.walk(root):
+        # 归一化分隔符: Windows 下 os.sep 是 '\', 不能直接 endswith 正斜杠路径
+        norm = dirpath.replace(os.sep, "/")
+        is_rpcd = norm.endswith("usr/share/rpcd/ucode")
         for fn in files:
-            if not fn.endswith(".ut"):
-                continue
             p = os.path.join(dirpath, fn)
+            if is_rpcd:
+                kind = "rpcd"
+            elif fn.endswith(".ut"):
+                kind = ".ut"
+            elif fn.endswith(".uc"):
+                kind = ".uc"
+            else:
+                continue
             try:
                 src = open(p, encoding="utf-8").read()
             except Exception:
                 continue
-            scanned += 1
-            # 只看 ucode 代码块, 避免误伤 CSS 里的 rgba()/blur()/url()
-            code = "\n".join(
-                (m.group(2) or "") + "\n" + (m.group(4) or "")
-                for m in CODE_SPAN.finditer(src)
-            )
+            stats[kind] += 1
+            code = strip_comments(ucode_of(p, src))
             for pat, why in BANNED:
                 m = re.search(pat, code)
                 if m:
                     line = code.count("\n", 0, m.start()) + 1
-                    fails.append(f"{p}: 命中 {why}")
+                    fails.append(f"{p}:{line} 命中 {why}")
 
 print("=" * 66)
-print(f"崩溃守卫: 扫描 {scanned} 个 .ut 模板")
+print(f"崩溃守卫: 扫描 {stats['.ut']} 个 .ut 模板 + {stats['.uc']} 个 .uc 控制器 "
+      f"+ {stats['rpcd']} 个 rpcd ucode 脚本")
 print("=" * 66)
 if fails:
-    print("::error::以下模板调用了 ucode 中不存在的函数, 会导致 LuCI 500:")
+    print("::error::以下 ucode 文件调用了不存在的函数, 会导致 LuCI 500 或 rpcd 方法崩溃:")
     for f in fails:
         print("   ", f)
     sys.exit(1)
-print("  通过: 无 String()/Number()/JSON.* 等 ucode 未注册调用")
+print("  通过: 无 String()/Number()/unixtime()/parseInt()/JSON.* 等未注册调用")
+print("  覆盖范围含 rpcd ucode 脚本 (luci.liuli 的 String()/unixtime() 就藏在这里, "
+      ".ut 扫描抓不到)")
 
 # ---- 5b. getspnam 纵深防御(曾误判为主因, 保留以防换 luci 版本复发) ----
 OLD = "{% if (getuid() == 0 && getspnam('root')?.pwdp === ''): %}"

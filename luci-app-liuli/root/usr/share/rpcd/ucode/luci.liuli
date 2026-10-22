@@ -17,6 +17,19 @@ const STATE_FILE = '/var/run/liuli-daily.json';
 
 /* ---------- helpers ---------- */
 
+/* ucode 的全局函数表里并没有 JS 风格的 String 构造器
+ * (jow-/ucode lib.c 的 uc_stdlib_functions[] 只注册了 71 个内置:
+ *  chr/die/exists/exit/filter/getenv/hex/index/int/join/keys/lc/length/
+ *  ltrim/map/ord/pop/print/push/reverse/rindex/rtrim/shift/sort/splice/
+ *  slice/split/substr/time/trim/type/uchr/uc/unshift/values/sprintf/
+ *  printf/require/iptoarr/arrtoip/match/replace/json/include/warn/system/
+ *  trace/proto/sleep/assert/render/regexp/wildcard/sourcepath/min/max/
+ *  b64dec/b64enc/uniq/localtime/gmtime/timelocal/timegm/clock/hexdec/
+ *  hexenc/gc/loadstring/loadfile/call/signal —— 没有 String)。
+ * 在 ucode 里对它做函数调用会抛 "left-hand side is not a function"。
+ * 这里用模板字面量实现等价的安全转字符串。 */
+const liuli_str = (v) => (v == null ? '' : `${v}`);
+
 function sh(cmd) {
 	const fd = popen(cmd + ' 2>/dev/null', 'r');
 	if (!fd)
@@ -58,8 +71,11 @@ function is_ipv4(s) {
 }
 
 function num(s) {
-	const n = int(trim(String(s ?? '')));
-	return (n == null) ? 0 : n;
+	const n = int(trim(liuli_str(s ?? '')));
+	/* int() 对非数字串返回 NaN 而不是 null (lib.c uc_int: strtoll 未消费
+	 * 任何字符时 e == v -> ucv_double_new(NAN))。NaN 既不 == null 也会污染
+	 * 下游的 * 1024 与 %J 序列化, 所以用 "自身不等于自身" 把它挡掉。 */
+	return (n == null || n != n) ? 0 : n;
 }
 
 /* ---------- 设备相关数据 ---------- */
@@ -102,6 +118,9 @@ function readArp() {
 function readStations() {
 	const stations = [];
 	const radios = ubusCall('luci-rpc', 'getWirelessDevices') ?? {};
+	/* ubus 连接在循环外只建一次: 每个无线接口各建一条会让 getDevices 的
+	 * ubus socket 数随接口数线性增长 */
+	const ubus = connect();
 
 	for (let name, radio in radios) {
 		const ifaces = radio?.interfaces ?? [];
@@ -111,7 +130,6 @@ function readStations() {
 				continue;
 			let res = null;
 			try {
-				const ubus = connect();
 				res = ubus?.call('iwinfo', 'assoclist', { device: dev });
 			} catch (e) {}
 			for (let st of (res?.results ?? [])) {
@@ -304,7 +322,7 @@ function cpuInfo() {
 	if (!count)
 		count = 1;
 
-	const usage = trim(sh("top -n1 | awk '/^CPU/ {printf(\"%d\", 100 - $8)}'") ?? '');
+	const usage = trim(sh("top -n1 | awk '/^CPU/ {for (i = 2; i < NF; i++) if ($i == \"idle\") { printf \"%d\", 100 - $(i-1); exit }}'") ?? '');
 	let pct = int(usage);
 	if (pct == null)
 		pct = null;
@@ -459,12 +477,35 @@ function processes() {
 	if (!s)
 		return out;
 
+	/* busybox top 的进程表头形如
+	 *   PID  PPID USER     STAT   VSZ %CPU %MEM COMMAND
+	 * 但不同 busybox 配置的列数/顺序会有差异, 所以按表头名定位列号,
+	 * 而不是硬编码下标 (硬编码曾把 %MEM 当成 %CPU 输出)。 */
 	let started = false;
+	let col = { pid: 0, ppid: 1, user: 2, stat: 3, vsz: 4, cpu: 5, cmd: 7 };
 
 	for (let line of split(s, '\n')) {
 		if (!started) {
-			if (match(line, /^\s*PID\s+PPID\s+USER/))
+			if (match(line, /^\s*PID\s+PPID\s+USER/)) {
 				started = true;
+				const h = split(trim(line), /[ \t]+/);
+				const at = (name) => {
+					for (let i = 0; i < length(h); i++)
+						if (h[i] == name)
+							return i;
+					return null;
+				};
+				const p = at('PID'), u = at('USER'), c = at('%CPU'), m = at('COMMAND');
+				if (p != null && u != null && c != null && m != null) {
+					col.pid = p;
+					col.user = u;
+					col.cpu = c;
+					col.cmd = m;
+					col.ppid = (p + 1 < length(h)) ? p + 1 : p;
+					col.stat = (u > 1) ? u - 1 : u;
+					col.vsz = (c > 1) ? c - 1 : c;
+				}
+			}
 			continue;
 		}
 
@@ -473,17 +514,17 @@ function processes() {
 			continue;
 
 		const f = split(l, /[ \t]+/);
-		if (length(f) < 8)
+		if (length(f) <= col.cmd)
 			continue;
 
 		push(out, {
-			pid: num(f[0]),
-			ppid: num(f[1]),
-			user: f[2],
-			stat: f[3],
-			vsz: num(f[4]),
-			cpu: num(replace(f[6], '%', '')),
-			command: join(' ', slice(f, 7))
+			pid: num(f[col.pid]),
+			ppid: num(f[col.ppid]),
+			user: f[col.user],
+			stat: f[col.stat],
+			vsz: num(f[col.vsz]),
+			cpu: num(replace(f[col.cpu], '%', '')),
+			command: join(' ', slice(f, col.cmd))
 		});
 
 		if (length(out) >= 12)
@@ -577,7 +618,13 @@ function wirelessRadios() {
 }
 
 function logEntries(n) {
-	const count = int(n) || 40;
+	/* lines 由前端传入, 先夹到合理区间再拼进 shell (原写法直接把
+	 * request?.args?.lines 拼进 logread 命令行) */
+	let count = int(n);
+	if (count == null || count != count || count < 1)
+		count = 40;
+	if (count > 500)
+		count = 500;
 	const res = ubusCall('log', 'read', { lines: count, stream: false, oneshot: true });
 	const out = [];
 
@@ -589,12 +636,12 @@ function logEntries(n) {
 	if (raw && type(raw) == 'array') {
 		for (let e of raw) {
 			if (type(e) == 'array')
-				out.push({ time: e[0] ?? null, priority: e[1] ?? 6, msg: trim(String(e[3] ?? e[2] ?? '')) });
+				out.push({ time: e[0] ?? null, priority: e[1] ?? 6, msg: trim(liuli_str(e[3] ?? e[2] ?? '')) });
 			else if (type(e) == 'object')
 				out.push({
 					time: e.time ?? null,
 					priority: (e.priority != null) ? e.priority : 6,
-					msg: trim(String(e.msg ?? e.message ?? ''))
+					msg: trim(liuli_str(e.msg ?? e.message ?? ''))
 				});
 		}
 	}
@@ -616,16 +663,19 @@ function logEntries(n) {
 /* ---------- 外网延迟探测 (借鉴 Open-Box 的延迟测速卡) ---------- */
 
 function shellquote(s) {
-	return replace(String(s ?? ''), /[^0-9a-zA-Z._:-]/g, '');
+	return replace(liuli_str(s ?? ''), /[^0-9a-zA-Z._:-]/g, '');
 }
 
 /* ucode 没有 parseFloat / Number:
- * 乘法运算会强制把数字字符串转成数值 ("12.4" * 1 → 12.4) */
+ * 乘法运算会强制把数字字符串转成数值 ("12.4" * 1 → 12.4)。
+ * 但非数字串参与算术得到的是 NaN 而不是 null
+ * (vm.c uc_vm_value_arith: ucv_to_number 失败 -> ucv_double_new(NAN)),
+ * 所以必须显式把 NaN 判掉, 否则 NaN 会被当成有效时延返回给前端。 */
 function toNum(s) {
 	if (type(s) == 'int' || type(s) == 'double')
 		return s;
 	const n = s * 1;
-	return (type(n) == 'int' || type(n) == 'double') ? n : null;
+	return (type(n) == 'int' || type(n) == 'double') && n == n ? n : null;
 }
 
 /* 探测单个目标: 返回毫秒数 (失败为 null)。先 IPv4 后 IPv6。
@@ -820,7 +870,11 @@ const methods = {
 				results = fallback;
 			}
 
-			return { results: results, ts: unixtime() };
+			/* time() 是已注册的全局函数 (uc_stdlib_functions[] 第 29 项),
+		 * 返回 Unix 时间戳(秒)。ucode 的全局函数表里并没有那个以
+		 * "unix" + "time" 拼出来的同名函数, 调用不存在的全局函数会抛
+		 * "left-hand side is not a function"。 */
+		return { results: results, ts: time() };
 		}
 	},
 

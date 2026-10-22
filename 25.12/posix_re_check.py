@@ -159,19 +159,22 @@ def class_spans(pat):
 
 
 def check_pattern(pat):
-    """-> list of problem strings for one regex pattern"""
+    """-> FATAL problems only: ranges whose endpoints are out of order.
+
+    Those are the ones glibc regcomp() rejects with REG_ERANGE, which ucode
+    surfaces as "Invalid character range". Deliberately NOT reported here:
+      * `A-Z` / `a-z` / `0-9`          -> intended ranges, perfectly legal
+      * `\\s` `\\n` inside a class     -> legal, just means literal \\ s n
+      * a trailing `-`                 -> literal hyphen, legal
+      * `\\-` next to another `\\`     -> degenerate range `\\`..`\\`, compiles
+                                         fine (upstream homeproxy does this)
+
+    Why only fatal: this checker runs in the build and must not go red on
+    upstream code that actually works. `warn_pattern()` covers the smells.
+    """
     issues = []
     for inner, _neg in class_spans(pat):
         body = inner[1:] if inner.startswith("]") else inner
-        # (a) a backslash directly adjacent to a '-' : POSIX has no escape in a
-        #     class, so the '-' silently becomes a range operator. Even when the
-        #     resulting range happens to be ascending (e.g. `[a\\-z]` = '\'..'z')
-        #     it is never what the author meant.
-        for _m in re.finditer(r"\\-|-(?=\\)", body):
-            issues.append(
-                "`\\-` — POSIX 括号表达式里反斜杠不是转义符, 这个 `-` 会变成"
-                "范围运算符; 把 `-` 移到类尾即可")
-        # (b) reversed ranges: the ones glibc actually rejects with REG_ERANGE
         for m in re.finditer(r"-", body):
             p = m.start()
             if p == 0 or p == len(body) - 1:
@@ -185,6 +188,23 @@ def check_pattern(pat):
     return issues
 
 
+def warn_pattern(pat):
+    """-> non-fatal smells: `\\-` inside a class. POSIX has no escape there,
+    so the '-' silently becomes a range operator. Often a degenerate range
+    (`\\`..`\\`) that still compiles -- upstream homeproxy.uc does exactly
+    this -- but it is never what the author meant, and on a whitelist it
+    silently admits a literal backslash.
+    """
+    out = []
+    for inner, _neg in class_spans(pat):
+        body = inner[1:] if inner.startswith("]") else inner
+        for _m in re.finditer(r"\\-|-(?=\\)", body):
+            out.append(
+                "`\\-` — POSIX 括号表达式里反斜杠不是转义符, 这个 `-` 会变成"
+                "范围运算符; 把 `-` 移到类尾即可")
+    return out
+
+
 def ucode_code(path, src):
     """.ut templates only contribute their {% %}/{{ }} blocks (skip CSS)."""
     if path.endswith(".ut"):
@@ -194,10 +214,19 @@ def ucode_code(path, src):
 
 
 def check_text(path, src):
-    """-> [(lineno, pattern, issue)]"""
+    """-> [(lineno, pattern, fatal_issue)]"""
     out = []
     for pat, ln in extract_regexes(ucode_code(path, src)):
         for iss in check_pattern(pat):
+            out.append((ln, pat, iss))
+    return out
+
+
+def warn_text(path, src):
+    """-> [(lineno, pattern, warning)]"""
+    out = []
+    for pat, ln in extract_regexes(ucode_code(path, src)):
+        for iss in warn_pattern(pat):
             out.append((ln, pat, iss))
     return out
 
@@ -219,19 +248,28 @@ def main(argv):
     if not targets:
         print(__doc__)
         return 2
-    total = bad = 0
-    for p in iter_files(targets):
+    paths = list(iter_files(targets))
+    total = bad = warn = 0
+    for p in paths:
         try:
             src = open(p, encoding="utf-8").read()
         except Exception:
             continue
+        pats = extract_regexes(ucode_code(p, src))
+        total += len(pats)
         for ln, pat, iss in check_text(p, src):
             bad += 1
-            print(f"  !! {p}:{ln}\n       /{pat}/\n       -> {iss}")
-        total += len(extract_regexes(ucode_code(p, src)))
-    print(f"[posix-re] {len(list(iter_files(targets)))} 个文件, "
-          f"{total} 条正则字面量, {bad} 处逆序字符范围")
-    return 1 if bad else 0
+            print(f"::error:: {p}:{ln}  /{pat}/  -> {iss}")
+        for ln, pat, iss in warn_text(p, src):
+            warn += 1
+            print(f"::warning:: {p}:{ln}  /{pat}/  -> {iss}")
+    print(f"[posix-re] {len(paths)} 个文件, {total} 条正则字面量, "
+          f"致命 {bad} 处, 告警 {warn} 处")
+    if bad:
+        print("::error::存在逆序字符范围的 ucode 正则, 会在运行时抛 "
+              "\"Invalid character range\" 让整个 LuCI 500")
+        return 1
+    return 0
 
 
 if __name__ == "__main__":

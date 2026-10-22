@@ -374,7 +374,11 @@ echo "自检通过: 无 ucode 未注册函数调用"
 # = U+005C..U+002E —— 逆序 -> REG_ERANGE -> "Invalid character range"。
 # 官方 idiom: '-' 放类尾, 不写 \[ 与 \]
 # (dispatcher.uc:734 `/^[A-Za-z0-9_%.\/,;-]+$/`, lxc.uc:23 `[A-Za-z0-9_-]{0,63}`)
-# 该检查对出厂固件自带的 59 个 ucode 文件做过假阳性对照: 除 liuli 自身外零命中。
+# 该检查对出厂固件自带的 59 个 ucode 文件做过假阳性对照: 致命的「逆序范围」
+# 在 liuli 自身之外零命中。注意只把**逆序范围**当致命错误 —— 上游
+# luci-app-homeproxy 也写了 `[A-Za-z0-9\+\-\_\.]`, 但那是退化范围
+# (`\`..`\`, 同字符), regcomp 能编译通过, 所以只作 ::warning:: 告警,
+# 否则会把本来能用的上游代码拦在构建期。
 # GITHUB_WORKSPACE 在 CI 里由 Actions 注入; 本地单独跑时按脚本位置反推。
 if [ -n "${GITHUB_WORKSPACE:-}" ] && [ -f "$GITHUB_WORKSPACE/25.12/posix_re_check.py" ]; then
 	POSIX_RE_CHECK="$GITHUB_WORKSPACE/25.12/posix_re_check.py"
@@ -383,5 +387,5 @@ else
 fi
 python3 "$POSIX_RE_CHECK" feeds/luci package/custom
 
-echo "自检通过: 无逆序字符范围的 POSIX ERE"
+echo "自检通过: 无逆序字符范围的 POSIX ERE (告警不阻断)"
 echo "==================== diy-part1: 完成 ===================="

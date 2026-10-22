@@ -8,27 +8,28 @@
 #   3. 灌入 Lucky: 官方 luci-app-lucky v3.3.3 + 预编译静态核心 Makefile
 #   4. 更新并安装 feeds
 #   5. 【崩溃守卫】扫描所有 ucode 源码 (.ut 模板 + .uc 控制器 + rpcd 脚本),
-#      禁止调用 ucode 里不存在的函数
+#      禁止调用 ucode 里不存在的函数; 并扫描 POSIX ERE, 禁止逆序字符范围
 #   6. 把镜像默认主题改为琉璃
 #
-# 关于第 5 条 —— 这是真·根因防线:
-#   刷机后 LuCI 打不开, 报
-#       Unhandled exception during request dispatching /
-#       left-hand side is not a function
-#       (runtime.uc:133 <- dispatcher.uc:960)
-#   根因是 ucode 的全局函数表里**没有 String()**
-#   (jow-/ucode 的 lib.c 只注册了 71 个内置: chr/die/int/sprintf/min/max/uniq/
-#    match/... 全部没有 String)。调用 String(x) 等于调用 undefined,
-#   直接抛 "left-hand side is not a function"; 而 sysauth 的渲染同时被
-#   dispatcher.uc:953(主题 sysauth) 和 :960(base sysauth 回退) 两条路走到,
-#   两条都炸, 整个 LuCI 就 500 了。
+# 关于第 5 条 —— 这是真·根因防线, 而且已经抓到过两轮:
 #
-#   第二轮审计又发现同一个病在 rpcd 后端复发: luci.liuli 里有 4 处 String()
-#   和 1 处 unixtime(), 让 getSystem/getLog/ping 三个 ubus 方法全部崩溃。
-#   旧守卫只扫 .ut 模板, 完全看不到 root/usr/share/rpcd/ucode/ 下的脚本 ——
-#   这就是它漏掉的原因。现在守卫覆盖三类 ucode 源码。
+#   第一轮 (left-hand side is not a function):
+#     根因是 ucode 的全局函数表里**没有 String()**
+#     (jow-/ucode 的 lib.c 只注册了 71 个内置)。调用 String(x) 等于调用
+#     undefined, 直接抛异常; 而 sysauth 的渲染同时被 dispatcher.uc:953(主题
+#     sysauth) 和 :960(base sysauth 回退) 两条路走到, 两条都炸, 整个 LuCI
+#     就 500 了。
 #
-#   注意: 此前误判为 getspnam。取证结果推翻了它 ——
+#   第二轮 (Invalid character range):
+#     同一个病在 rpcd 后端复发 (luci.liuli 里 4 处 String() + 1 处
+#     unixtime()), 说明守卫只扫 .ut 模板是盲区 —— 现已覆盖 .ut/.uc/rpcd。
+#     修掉 String() 之后又暴露了第三层: ucode 的 match() 走 glibc
+#     regcomp(REG_EXTENDED), 而 POSIX 规定**括号表达式内的反斜杠是普通
+#     字符, 不是转义符**, 于是 `[A-Za-z0-9\-._~...]` 变成范围
+#     '\'(U+005C)..'.'(U+002E) —— 逆序 -> REG_ERANGE -> "Invalid character
+#     range"。现由 5b 的 posix_re_check.py 专门把关。
+#
+#   注意: 此前还误判过 getspnam。取证结果推翻了它 ——
 #   /usr/lib/ucode/luci/core.so 在「可用固件」和「崩溃固件」里字符串表
 #   完全一致(137 条, 零差异), getspnam 两边都导出了。
 #   getspnam 守卫保留为纵深防御, 但不再是主防线。
@@ -359,4 +360,28 @@ else:
 GUARD_PYEOF
 
 echo "自检通过: 无 ucode 未注册函数调用"
+
+# ---------------------------------------------------------
+# 5b. POSIX ERE 守卫: 禁止逆序字符范围的正则
+# ---------------------------------------------------------
+# 症状: 刷机后 LuCI 500, 报
+#     Invalid character range
+#     (runtime.uc:133 <- dispatcher.uc:960)
+# 根因: ucode 的 match()/replace() 直接把模式交给 glibc regcomp(REG_EXTENDED),
+# 而 POSIX 规定**括号表达式内的反斜杠是普通字符, 不是转义符**。于是
+#     /^[A-Za-z0-9\-._~:\/?#\[\]@!$&*+,;=%() ]*$/
+# 被解析成 class(A-Z a-z 0-9 '\') 紧跟范围('\', '.')
+# = U+005C..U+002E —— 逆序 -> REG_ERANGE -> "Invalid character range"。
+# 官方 idiom: '-' 放类尾, 不写 \[ 与 \]
+# (dispatcher.uc:734 `/^[A-Za-z0-9_%.\/,;-]+$/`, lxc.uc:23 `[A-Za-z0-9_-]{0,63}`)
+# 该检查对出厂固件自带的 59 个 ucode 文件做过假阳性对照: 除 liuli 自身外零命中。
+# GITHUB_WORKSPACE 在 CI 里由 Actions 注入; 本地单独跑时按脚本位置反推。
+if [ -n "${GITHUB_WORKSPACE:-}" ] && [ -f "$GITHUB_WORKSPACE/25.12/posix_re_check.py" ]; then
+	POSIX_RE_CHECK="$GITHUB_WORKSPACE/25.12/posix_re_check.py"
+else
+	POSIX_RE_CHECK="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/25.12/posix_re_check.py"
+fi
+python3 "$POSIX_RE_CHECK" feeds/luci package/custom
+
+echo "自检通过: 无逆序字符范围的 POSIX ERE"
 echo "==================== diy-part1: 完成 ===================="

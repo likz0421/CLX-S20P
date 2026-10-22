@@ -179,6 +179,40 @@ for p in sorted(files):
             print(f"      !! {p} 含 {name}")
 chk(not bad, f"扫描 {stats['.ut']} 模板 + {stats['.uc']} 控制器 + {stats['rpcd']} rpcd 脚本, 违规 {len(bad)}")
 
+# ---- 1b. POSIX ERE: 出厂 ucode 里不能有逆序字符范围的正则 ----
+# ucode 的 match()/replace() 走 glibc regcomp(REG_EXTENDED), POSIX 规定括号
+# 表达式内的反斜杠是普通字符而非转义符, 所以 `[A-Za-z0-9\-._]` 会变成
+# 范围('\' U+005C, '.' U+002E) —— 逆序 -> REG_ERANGE ->
+# "Invalid character range", 整个 LuCI 500。规则与 diy-part1.sh 的 5b 同源。
+print("\n[1b] POSIX ERE 复核 — 所有出厂 ucode 源码")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    import posix_re_check
+except ImportError:
+    posix_re_check = None
+    print("  [WARN] 找不到 posix_re_check.py, 跳过")
+
+if posix_re_check:
+    re_total = re_bad = 0
+    for p in sorted(files):
+        if p.startswith("/usr/share/rpcd/ucode/"):
+            kind = "rpcd"
+        elif p.endswith(".ut"):
+            kind = ".ut"
+        elif p.endswith(".uc"):
+            kind = ".uc"
+        else:
+            continue
+        d = rd(p)
+        if not d:
+            continue
+        re_total += len(posix_re_check.extract_regexes(
+            posix_re_check.ucode_code(p, d)))
+        for ln, pat, iss in posix_re_check.check_text(p, d):
+            re_bad += 1
+            print(f"      !! {p}:{ln}  /{pat}/  -> {iss}")
+    chk(re_bad == 0, f"扫描 {re_total} 条正则, 逆序字符范围 {re_bad}")
+
 # ---- 2. 琉璃主题模板齐全且已修复 ----
 print("\n[2] 琉璃 Liuli 主题")
 for name in ("footer.ut", "head.ut", "header.ut", "page_scripts.ut", "sysauth.ut"):

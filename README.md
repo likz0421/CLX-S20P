@@ -227,3 +227,70 @@ for node in img.root.iterdir():                 # 递归遍历
 - 出厂固件复验器收进仓库成为**唯一事实源**：
   `25.12/verify-firmware.py`，CI 的「Verify built firmware」步骤直接跑它，
   本地 `_verify/verify.py` 也是它，两边规则不可能再漂移。
+
+---
+
+## 第三轮：修掉 `String()` 后暴露的下一层 —— `Invalid character range`
+
+用户刷入后 LuCI 仍 500，但报错换了：
+
+```
+Unhandled exception during request dispatching
+Invalid character range
+(runtime.uc:133 <- dispatcher.uc:960)
+```
+
+### 根因
+
+`Invalid character range` 是 glibc `regcomp()` 的 `REG_ERANGE`。ucode 的
+`match()` / `replace()` 直接把模式交给 glibc `regcomp(REG_EXTENDED)`，
+而 **POSIX 规定括号表达式 `[...]` 内的反斜杠是普通字符，不是转义符**。
+
+琉璃 `head.ut` / `sysauth.ut` 的 `safe()` 写的是：
+
+```ucode
+match(v, /^[A-Za-z0-9\-._~:\/?#\[\]@!$&*+,;=%() ]*$/)
+```
+
+实际被解析成：字符类 `A-Z a-z 0-9 \` 紧跟**范围** `\`..`.`
+= U+005C..U+002E —— **逆序** → `REG_ERANGE` → 整个 LuCI 500。
+（`\[\]` 同样无效：POSIX 无法转义它们，`\]` 还会提前闭合字符类。）
+
+这就是典型的「剥洋葱」：`String()` 在 `safe()` 里先抛，遮住了后面的正则错误；
+修掉 `String()`，正则错误才浮出来。
+
+### 正确写法（官方自己的 idiom）
+
+出厂固件里所有含连字符的字符类，**一律把 `-` 放在类尾，从不写 `\-`**：
+
+| 位置 | 正则 |
+|------|------|
+| `dispatcher.uc:734` | `/^[A-Za-z0-9_%.\/,;-]+$/` |
+| `lxc.uc:23` | `/^[A-Za-z0-9_-]{0,63}$/` |
+| `dispatcher.uc:231` | `/^@([A-Za-z0-9_-]+)$/` |
+| `fw4.uc:1649` | `/^[a-zA-Z_.][a-zA-Z0-9\/_.-]*$/` |
+
+修复后（12 处副本，6 棵源码树）：
+
+```ucode
+match(v, /^[A-Za-z0-9._~:\/?#@!$&*+,;=%() -]*$/)
+```
+
+`\/` 保留 —— ucode 词法器需要它，否则 `/` 会提前结束正则字面量；
+glibc 只把它当作「字面反斜杠 + 字面斜杠」，而这是白名单，多放行一个字符无风险。
+
+### 验证
+
+- 旧正则在 POSIX ERE 下：`grep: Invalid range end`（复现用户错误）
+- 新正则：编译通过；`auto`/`light`/`dark`/`none`/`bing`/URL/路径 全部 MATCH，
+  `a"b`/`a<b>c`/`a'b`/`a[b]c`/空串 全部拒绝回退默认值
+- `tpl_lint.py` v3 全量 23 模板 / 370 调用点：**0 问题**（确认没有第四层）
+- `posix_re_check.py` 正/负向自测：负向 5/5 命中、正向 11/11 放行
+- 假阳性对照：出厂固件 59 个 ucode 文件 / 114 条正则 → 仅命中 liuli 自身
+
+### 防复发
+
+- `25.12/posix_re_check.py` 专职检查「逆序字符范围」+「`\-` 误用」，
+  `diy-part1.sh` 第 5b 步在构建期调用，命中即 `exit 1`
+- `25.12/verify-firmware.py` 新增 `[1b]` 组，出厂固件同样检查
+- 与 `[1]` 未注册函数检查共用同一套「三类 ucode 源码」遍历逻辑

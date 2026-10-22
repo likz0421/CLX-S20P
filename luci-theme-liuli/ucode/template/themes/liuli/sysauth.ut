@@ -30,7 +30,7 @@
 	};
 	const safe = (k, d) => {
 		const v = liuli_str(raw(k, d) ?? '');
-		return match(v, /^[A-Za-z0-9\-._~:\/?#\[\]@!$&*+,;=%() ]*$/) ? v : d;
+		return match(v, /^[A-Za-z0-9._~:\/?#@!$&*+,;=%() -]*$/) ? v : d;
 	};
 
 	const c_primary  = color('primary', '#5b7cfa');

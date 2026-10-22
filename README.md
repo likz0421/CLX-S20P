@@ -5,9 +5,35 @@
 - 设备：`mediatek/filogic · clx_s20p · aarch64_cortex-a53`
 - 源码：`chasey-dev/immortalwrt-mt798x-rebase` 分支 `25.12`
 - 基线配置：`25.12/s20p.config`，取自 SmartRouterZone 官方 release
-  `v25.12-mtk-k6.12`（tag `20260215`，源码 commit `6ff0496`）的 `config.buildinfo`，
-  保证与官方稳定版包集合一致。
+  `v25.12-mtk-k6.12`（tag `20260215`，源码 commit `6ff0496`）的 `config.buildinfo`
 - 追加内容：**琉璃 Liuli 主题**（设为默认主题）+ **琉璃看板** + **Lucky**
+
+## ⚠️ 必须知道：本仓库**不是**官方源码的修改版
+
+`SmartRouterZone/CLX-S20P` 上游仓库**没有 25.12 源码分支**，它只有：
+
+```
+21.02-mtk-k5.4    24.10-mtk-k6.6    master(救砖工具)    merge-24.10
+```
+
+它的 `v25.12-mtk-k6.12` release 是用上游 `chasey-dev/immortalwrt-mt798x-rebase`
+构建的（可从官方固件的 `/etc/openwrt_release` 里 `DISTRIB_REVISION='r0-6ff0496'`
+反查到）。本仓库只是 **fork 了它的仓库名**并沿用其配置基线，源码取自上游分支。
+
+### 实际产物 = 官方配置基线 + 上游最新代码
+
+| | 官方 v25.12 release | 本仓库构建 |
+|---|---|---|
+| 源码 commit | `6ff0496`（2026-02-14） | 分支 `25.12` 当前 HEAD `03eb306`（2026-10-15） |
+| luci-base | 26.042.32073~dd800de | **26.293.13009~61e876e** |
+| ucode / libucode | 2025.12.01~f7c2b97a-r1 | **2026.01.16~85922056-r2** |
+| rpcd | 2025.12.03~ffb9961c-r1 | **2026.10.04~d99f703e-r1** |
+| uhttpd | 2025.10.03~ebb92e6b-r1 | **2026.08.24~373145f7-r1** |
+| 包总数 | 516 | 527 |
+
+也就是：**包集合（配置）与官方一致，但代码版本比官方 release 新约 8 个月。**
+想要与官方快照逐位一致的构建，需要额外 pin：源码 `6ff0496`、
+luci feed `dd800de`、packages feed 到 2026-02-14 附近（三个坐标均已验证可定位）。
 
 ## 目录
 

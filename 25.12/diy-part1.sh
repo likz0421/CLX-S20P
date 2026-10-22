@@ -3,13 +3,16 @@
 # CLX-S20P — ImmortalWrt 25.12 (mtk k6.12) DIY part1
 #
 # 做什么:
-#   1. 追加 Lucky 所需 feeds(nas / nas_luci / istore)
-#   2. 把仓库内自带的「琉璃 Liuli 主题 + 琉璃看板」拷进编译树
-#   3. 灌入 Lucky: 官方 luci-app-lucky v3.3.3 + 预编译静态核心 Makefile
-#   4. 更新并安装 feeds
-#   5. 【崩溃守卫】扫描所有 ucode 源码 (.ut 模板 + .uc 控制器 + rpcd 脚本),
+#   1. 灌入 Lucky: 官方 luci-app-lucky v3.3.3 + 预编译静态核心 Makefile
+#   2. 灌入 Argon 主题: jerrykuku/luci-theme-argon v3.1.0 (指定 tag 克隆)
+#      feed 里的 argon 只有 2.4.7, 所以克隆后移除 feed 副本避免同包名冲突
+#   3. 更新并安装 feeds
+#   4. 【崩溃守卫】扫描所有 ucode 源码 (.ut 模板 + .uc 控制器 + rpcd 脚本),
 #      禁止调用 ucode 里不存在的函数; 并扫描 POSIX ERE, 禁止逆序字符范围
-#   6. 把镜像默认主题改为琉璃
+#   5. 把镜像默认主题改为 Argon
+#
+# 已下线的插件 (2026-10-22 清理): 琉璃 Liuli 主题/看板、SmartDNS、LXC 容器、
+# WireGuard、组播转换 (msd_lite)。仅保留 Lucky 与 UPnP。
 #
 # 关于第 5 条 —— 这是真·根因防线, 而且已经抓到过两轮:
 #
@@ -21,49 +24,51 @@
 #     就 500 了。
 #
 #   第二轮 (Invalid character range):
-#     同一个病在 rpcd 后端复发 (luci.liuli 里 4 处 String() + 1 处
+#     同一个病在 rpcd 后端复发 (当时的 luci.liuli 里 4 处 String() + 1 处
 #     unixtime()), 说明守卫只扫 .ut 模板是盲区 —— 现已覆盖 .ut/.uc/rpcd。
 #     修掉 String() 之后又暴露了第三层: ucode 的 match() 走 glibc
 #     regcomp(REG_EXTENDED), 而 POSIX 规定**括号表达式内的反斜杠是普通
 #     字符, 不是转义符**, 于是 `[A-Za-z0-9\-._~...]` 变成范围
 #     '\'(U+005C)..'.'(U+002E) —— 逆序 -> REG_ERANGE -> "Invalid character
-#     range"。现由 5b 的 posix_re_check.py 专门把关。
+#     range"。现由第 6 步的 posix_re_check.py 专门把关。
 #
 #   注意: 此前还误判过 getspnam。取证结果推翻了它 ——
 #   /usr/lib/ucode/luci/core.so 在「可用固件」和「崩溃固件」里字符串表
 #   完全一致(137 条, 零差异), getspnam 两边都导出了。
-#   getspnam 守卫保留为纵深防御, 但不再是主防线。
+#   getspnam 守卫保留为纵深防御, 但不再是主防线。它现在保护的是 Argon:
+#   jerrykuku/luci-theme-argon v3.1.0 的 header.ut:67 就有那段裸调用。
 #
 set -eo pipefail
 
 echo "==================== diy-part1: 开始 ===================="
 
 # ---------------------------------------------------------
-# 1. feeds
+# 1. 准备工作目录
+#    (原先为 Lucky 追加的 nas / nas_luci / istore feeds 已无用 —— Lucky 现在
+#     直接从 gdy666/luci-app-lucky 克隆, 配置里也没有任何 linkease/iStore
+#     包, 留着只会拖慢 feeds update, 故一并移除)
 # ---------------------------------------------------------
-touch feeds.conf.default
-grep -q "nas-packages.git" feeds.conf.default \
-  || echo 'src-git nas https://github.com/linkease/nas-packages.git;master' >> feeds.conf.default
-grep -q "nas-packages-luci" feeds.conf.default \
-  || echo 'src-git nas_luci https://github.com/linkease/nas-packages-luci.git;main' >> feeds.conf.default
-grep -q "istore" feeds.conf.default \
-  || echo 'src-git istore https://github.com/linkease/istore;main' >> feeds.conf.default
-
 mkdir -p package/custom
 
 # ---------------------------------------------------------
-# 2. 琉璃 Liuli 主题 + 琉璃看板
+# 2. Argon 主题: jerrykuku/luci-theme-argon v3.1.0
+#    feed 里的 argon 是 2.4.7, 差一个大版本, 所以按 tag 克隆指定版本,
+#    并在 feeds install 之前移除 feed 副本, 避免两个同名包打架。
 # ---------------------------------------------------------
-mkdir -p package/custom/liuli-theme package/custom/luci-app-liuli
-cp -r "$GITHUB_WORKSPACE/luci-theme-liuli/." package/custom/liuli-theme/
-cp -r "$GITHUB_WORKSPACE/luci-app-liuli/."  package/custom/luci-app-liuli/
+ARGON_TAG="v3.1.0"
+rm -rf package/custom/luci-theme-argon
+git clone --depth=1 -b "$ARGON_TAG" \
+  https://github.com/jerrykuku/luci-theme-argon.git \
+  package/custom/luci-theme-argon
 
-# 拷贝失败必须立刻失败: 否则 CONFIG_PACKAGE_luci-theme-liuli=y 会被 oldconfig
-# 静默丢掉, 最后编出一个"没有琉璃主题"的固件且全程绿灯
-[ -f package/custom/liuli-theme/Makefile ]   || { echo "::error::liuli 主题拷贝失败"; exit 1; }
-[ -f package/custom/luci-app-liuli/Makefile ] || { echo "::error::liuli 看板拷贝失败"; exit 1; }
-echo "琉璃 Liuli 已加入编译树:"
-ls package/custom/liuli-theme package/custom/luci-app-liuli
+# 克隆失败必须立刻失败: 否则 CONFIG_PACKAGE_luci-theme-argon=y 会被 oldconfig
+# 静默丢掉, 最后编出一个"没有主题"的固件且全程绿灯
+[ -f package/custom/luci-theme-argon/Makefile ] \
+  || { echo "::error::Argon 主题克隆失败"; exit 1; }
+grep -q "PKG_VERSION:=3.1.0" package/custom/luci-theme-argon/Makefile \
+  || { echo "::error::Argon 版本不是 3.1.0 (tag $ARGON_TAG 可能变了)"; exit 1; }
+echo "Argon 主题 $ARGON_TAG 已加入编译树:"
+ls package/custom/luci-theme-argon | head -8
 
 # ---------------------------------------------------------
 # 3. Lucky: 官方 luci-app-lucky v3.3.3
@@ -161,9 +166,44 @@ echo "Lucky 已加入编译树"
 
 # ---------------------------------------------------------
 # 4. feeds 更新 + 安装
+#    安装前必须先删掉 feed 自带的 luci-theme-argon: feeds install -a 会把它
+#    软链到 package/feeds/luci/ 下, 与 package/custom/luci-theme-argon
+#    同包名, OpenWrt 的包扫描对同名包的处理不确定, 不要赌。
 # ---------------------------------------------------------
 ./scripts/feeds update -a
+
+if [ -d feeds/luci/themes/luci-theme-argon ]; then
+	echo "移除 feed 自带的 luci-theme-argon (只保留 v3.1.0 克隆):"
+	echo "   $(cd feeds/luci/themes/luci-theme-argon && git describe --tags 2>/dev/null || echo '(无 tag 信息)')"
+	rm -rf feeds/luci/themes/luci-theme-argon
+else
+	echo "::warning::feeds/luci/themes/luci-theme-argon 不存在, feed 结构可能变了"
+fi
+# 兜底: 万一 feed 调整了目录层级, 再把 feeds/ 下任何同名目录清掉
+find feeds -maxdepth 6 -type d -name luci-theme-argon -prune -exec rm -rf {} + 2>/dev/null || true
+
 ./scripts/feeds install -a
+
+# 硬校验: 全树只允许存在一个 luci-theme-argon **包根目录**。
+# 注意不能用 `find package -name Makefile -path '*luci-theme-argon*'` ——
+# 克隆下来的树里还有 compat/luci-app-argon-config/Makefile, 路径同样含
+# luci-theme-argon, 会被误数成第 2 份。
+ARGON_DIRS=$(find package -type d -name luci-theme-argon | sort)
+ARGON_N=$(printf '%s\n' "$ARGON_DIRS" | grep -c . || true)
+echo "luci-theme-argon 包根目录数量 = $ARGON_N"
+printf '%s\n' "$ARGON_DIRS" | sed 's/^/   /'
+if [ "$ARGON_N" != "1" ]; then
+	echo "::error::luci-theme-argon 出现 $ARGON_N 份 (应为 1), 同名包冲突"
+	exit 1
+fi
+if [ "$ARGON_DIRS" != "package/custom/luci-theme-argon" ]; then
+	echo "::error::生效的不是 package/custom 下的 v3.1.0 克隆"
+	exit 1
+fi
+if [ ! -f package/custom/luci-theme-argon/ucode/template/themes/argon/head.ut ]; then
+	echo "::error::v3.1.0 应有的 ucode 模板缺失, 克隆内容不完整"
+	exit 1
+fi
 
 # ---------------------------------------------------------
 # 5. 崩溃守卫 + 默认主题
@@ -182,8 +222,9 @@ fails = []
 # unixtime()/Date.now()/Math.*。这些名字在 ucode 里调用即抛
 # "left-hand side is not a function"。
 #
-# 下面这份规则表对出厂固件自带的 59 个 ucode 文件 (.ut/.uc/rpcd 脚本) 做过
-# 假阳性对照: 除 luci.liuli 自身外零命中, 所以不会误伤上游代码。
+# 下面这份规则表对出厂固件自带的 59 个 ucode 文件 (.ut/.uc/rpcd 脚本) 以及
+# jerrykuku/luci-theme-argon v3.1.0 的 13 个 ucode 文件做过假阳性对照:
+# 全部零命中, 所以不会误伤上游代码。
 BANNED = [
     (r"(?<![\w$.])String\s*\(",      "String()  — ucode 没有该全局函数, 用模板字面量 `${x}` 代替"),
     (r"(?<![\w$.])Number\s*\(",      "Number()  — ucode 没有该全局函数, 用 int()/乘法运算代替"),
@@ -320,10 +361,12 @@ if fails:
         print("   ", f)
     sys.exit(1)
 print("  通过: 无 String()/Number()/unixtime()/parseInt()/JSON.* 等未注册调用")
-print("  覆盖范围含 rpcd ucode 脚本 (luci.liuli 的 String()/unixtime() 就藏在这里, "
-      ".ut 扫描抓不到)")
+print("  覆盖范围含 rpcd ucode 脚本 (历史上的 String()/unixtime() 就藏在 rpcd "
+      "后端里, 只扫 .ut 模板抓不到)")
 
-# ---- 5b. getspnam 纵深防御(曾误判为主因, 保留以防换 luci 版本复发) ----
+# ---- 5b. getspnam 纵深防御(曾误判为主因, 保留以防换主题/luci 版本复发) ----
+# 现在真正保护的是 Argon: jerrykuku/luci-theme-argon v3.1.0 的
+# ucode/template/themes/argon/header.ut:67 就是那段裸调用。
 OLD = "{% if (getuid() == 0 && getspnam('root')?.pwdp === ''): %}"
 NEW = ("{% if (type(getuid) == 'function' && getuid() == 0 "
        "&& type(getspnam) == 'function' && (getspnam('root')?.pwdp ?? '') === ''): %}")
@@ -347,12 +390,12 @@ print(f"getspnam 守卫: 修补 {len(patched)} 个模板")
 for p in patched:
     print("   patched:", p)
 
-# ---- 5c. 镜像默认主题改为琉璃 ----
+# ---- 5c. 镜像默认主题改为 Argon ----
 cfg = "feeds/luci/modules/luci-base/root/etc/config/luci"
 if os.path.isfile(cfg):
     s = open(cfg, encoding="utf-8").read()
     s2 = re.sub(r"option mediaurlbase\s+\S+",
-                "option mediaurlbase /luci-static/liuli", s)
+                "option mediaurlbase /luci-static/argon", s)
     open(cfg, "w", encoding="utf-8").write(s2)
     print("默认主题 ->", [l for l in s2.splitlines() if "mediaurlbase" in l])
 else:
@@ -362,7 +405,7 @@ GUARD_PYEOF
 echo "自检通过: 无 ucode 未注册函数调用"
 
 # ---------------------------------------------------------
-# 5b. POSIX ERE 守卫: 禁止逆序字符范围的正则
+# 6. POSIX ERE 守卫: 禁止逆序字符范围的正则
 # ---------------------------------------------------------
 # 症状: 刷机后 LuCI 500, 报
 #     Invalid character range
@@ -373,9 +416,9 @@ echo "自检通过: 无 ucode 未注册函数调用"
 # 被解析成 class(A-Z a-z 0-9 '\') 紧跟范围('\', '.')
 # = U+005C..U+002E —— 逆序 -> REG_ERANGE -> "Invalid character range"。
 # 官方 idiom: '-' 放类尾, 不写 \[ 与 \]
-# (dispatcher.uc:734 `/^[A-Za-z0-9_%.\/,;-]+$/`, lxc.uc:23 `[A-Za-z0-9_-]{0,63}`)
-# 该检查对出厂固件自带的 59 个 ucode 文件做过假阳性对照: 致命的「逆序范围」
-# 在 liuli 自身之外零命中。注意只把**逆序范围**当致命错误 —— 上游
+# (dispatcher.uc:734 `/^[A-Za-z0-9_%.\/,;-]+$/`, fw4.uc:1649 `[a-zA-Z0-9\/_.-]*`)
+# 该检查对出厂固件自带的 59 个 ucode 文件 + argon v3.1.0 的 13 个做过假阳性
+# 对照: 致命的「逆序范围」零命中。注意只把**逆序范围**当致命错误 —— 上游
 # luci-app-homeproxy 也写了 `[A-Za-z0-9\+\-\_\.]`, 但那是退化范围
 # (`\`..`\`, 同字符), regcomp 能编译通过, 所以只作 ::warning:: 告警,
 # 否则会把本来能用的上游代码拦在构建期。

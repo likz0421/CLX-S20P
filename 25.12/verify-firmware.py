@@ -154,8 +154,8 @@ def chk(cond, label, detail=""):
 
 
 # ---- 1. 崩溃根因: 出厂 ucode 源码里不能有未注册函数调用 ----
-# 覆盖 .ut 模板 + .uc 控制器 + rpcd 脚本。rpcd 脚本是第二轮的审计盲区:
-# luci.liuli 的 4 处 String() 和 1 处 unixtime() 就藏在那里, 只扫 .ut 抓不到。
+# 覆盖 .ut 模板 + .uc 控制器 + rpcd 脚本。rpcd 脚本曾是审计盲区:
+# 历史上的 liuli 后端有 4 处 String() 和 1 处 unixtime() 藏在那里, 只扫 .ut 抓不到。
 print("[1] 崩溃根因复核 — 所有出厂 ucode 源码 (.ut / .uc / rpcd)")
 stats = {".ut": 0, ".uc": 0, "rpcd": 0}
 bad = []
@@ -213,44 +213,45 @@ if posix_re_check:
             print(f"      !! {p}:{ln}  /{pat}/  -> {iss}")
     chk(re_bad == 0, f"扫描 {re_total} 条正则, 逆序字符范围 {re_bad}")
 
-# ---- 2. 琉璃主题模板齐全且已修复 ----
-print("\n[2] 琉璃 Liuli 主题")
-for name in ("footer.ut", "head.ut", "header.ut", "page_scripts.ut", "sysauth.ut"):
-    p = f"/usr/share/ucode/luci/template/themes/liuli/{name}"
+# ---- 2. Argon 主题模板齐全 (v3.1.0) ----
+print("\n[2] Argon 主题 (jerrykuku v3.1.0)")
+ARGON_TPL = ("footer.ut", "head.ut", "header.ut", "page_scripts.ut", "sysauth.ut",
+             "head_meta.ut", "footer_login.ut", "header_login.ut",
+             "login_background.ut", "login_form.ut", "out_header_login.ut")
+for name in ARGON_TPL:
+    p = f"/usr/share/ucode/luci/template/themes/argon/{name}"
     chk(p in files, f"模板 {name}")
-hdr = rd("/usr/share/ucode/luci/template/themes/liuli/head.ut") or ""
-chk("const liuli_str" in hdr, "head.ut 含 liuli_str helper")
+hdr = rd("/usr/share/ucode/luci/template/themes/argon/head.ut") or ""
+chk(len(hdr) > 500, "head.ut 非空", f"{len(hdr)} chars")
 chk(not re.search(r"(?<![\w$.])String\s*\(", hdr), "head.ut 无裸 String()")
-sysauth = rd("/usr/share/ucode/luci/template/themes/liuli/sysauth.ut") or ""
-chk("const liuli_str" in sysauth, "sysauth.ut 含 liuli_str helper")
-css = rd("/www/luci-static/liuli/css/cascade.css")
-chk(css is not None and len(css) > 10000, "琉璃 CSS 已打进镜像",
+sysauth = rd("/usr/share/ucode/luci/template/themes/argon/sysauth.ut") or ""
+chk(len(sysauth) > 500, "sysauth.ut 非空", f"{len(sysauth)} chars")
+css = rd("/www/luci-static/argon/css/cascade.css")
+chk(css is not None and len(css) > 10000, "Argon CSS 已打进镜像",
     f"{len(css or '')} chars")
+# 设置页与资源
+for p, label in [("/www/luci-static/resources/view/argon-config.js", "Argon 设置页"),
+                 ("/etc/config/argon", "Argon 配置"),
+                 ("/www/luci-static/argon/img/argon.svg", "Argon 图标")]:
+    chk(p in files, label, p)
 
-# ---- 2b. rpcd 后端 (第二轮审计的修复点) ----
-print("\n[2b] 琉璃看板 rpcd 后端 luci.liuli")
-rp = rd("/usr/share/rpcd/ucode/luci.liuli") or ""
-chk("const liuli_str" in rp, "luci.liuli 含 liuli_str helper")
-chk(not re.search(r"(?<![\w$.])String\s*\(", rp), "luci.liuli 无裸 String()")
-chk(not re.search(r"(?<![\w$.])unixtime\s*\(", rp), "luci.liuli 无 unixtime()")
-chk("ts: time()" in rp, "ping 方法用 time() 取时间戳")
-chk("f[col.cpu]" in rp, "processes() 按表头名定位 %CPU 列")
-chk("n != n" in rp, "num()/toNum() 显式判 NaN")
-chk("const ubus = connect();" in rp and
-    "\t\t\ttry {\n\t\t\t\tconst ubus = connect();" not in rp,
-    "readStations() 循环外只建一次 ubus 连接",
-    f"connect() 调用点 = {rp.count('connect()')}")
-th = rd("/usr/share/rpcd/ucode/luci.liuli-theme") or ""
-chk('return { "liuli-theme": methods }' in th, "luci.liuli-theme 导出 luci-theme 对象")
-chk("ubus.call('uci', 'commit', { config: 'liuli' })" in th,
-    "luci.liuli-theme setConfig 提交 uci")
+# ---- 2b. UPnP + Lucky (2026-10-22 清理后仅保留的两个插件) ----
+print("\n[2b] UPnP 与 Lucky")
+for p, label in [("/usr/sbin/miniupnpd", "miniupnpd 守护进程"),
+                 ("/etc/config/upnpd", "UPnP 配置"),
+                 ("/www/luci-static/resources/view/upnp/status.js", "UPnP LuCI 页面"),
+                 ("/usr/bin/lucky", "lucky 核心二进制"),
+                 ("/etc/config/lucky", "lucky 配置"),
+                 ("/etc/init.d/lucky", "lucky 启动脚本"),
+                 ("/www/luci-static/resources/view/lucky/config-3_0_0-26.js", "lucky LuCI 页面")]:
+    chk(p in files, label, p)
 
-# ---- 3. 默认主题必须是琉璃 ----
-print("\n[3] 默认主题")
+# ---- 3. 默认主题必须是 Argon ----
+print("\n[3] 默认主题 (Argon)")
 cfg = rd("/etc/config/luci") or ""
 m = re.search(r"option\s+mediaurlbase\s+(\S+)", cfg)
 media = m.group(1) if m else "(none)"
-chk(media == "/luci-static/liuli", f"mediaurlbase = {media}")
+chk(media == "/luci-static/argon", f"mediaurlbase = {media}")
 
 # ---- 4. 裸 getspnam 全树扫描(纵深防御也应生效) ----
 print("\n[4] 裸 getspnam 扫描(纵深防御)")
@@ -266,13 +267,12 @@ chk(n == 0, f"裸 getspnam 模板数 = {n}")
 
 # ---- 5. 关键包是否真在镜像里 ----
 print("\n[5] 关键文件在位")
-for p, label in [("/usr/bin/lucky", "lucky 核心二进制"),
+for p, label in [("/www/luci-static/argon/css/cascade.css", "Argon 主题 CSS"),
+                 ("/usr/sbin/miniupnpd", "miniupnpd"),
+                 ("/usr/bin/lucky", "lucky 核心二进制"),
                  ("/etc/config/lucky", "lucky 配置"),
                  ("/etc/init.d/lucky", "lucky 启动脚本"),
-                 ("/www/luci-static/resources/view/lucky/config-3_0_0-26.js", "lucky LuCI 页面"),
-                 ("/www/luci-static/resources/view/liuli/dashboard.js", "琉璃看板页面"),
-                 ("/usr/share/rpcd/ucode/luci.liuli", "琉璃看板 rpcd"),
-                 ("/etc/config/liuli", "琉璃主题配置")]:
+                 ("/www/luci-static/resources/view/lucky/config-3_0_0-26.js", "lucky LuCI 页面")]:
     chk(p in files, label, p)
 
 # ---- 6. 版本信息 ----
@@ -283,7 +283,7 @@ for line in rel.splitlines():
         print("     ", line)
 chk("mediatek/filogic" in rel, "目标 = mediatek/filogic")
 
-# ---- 7. 已安装包 (liuli/lucky) ----
+# ---- 7. 已安装包 (argon/upnp/lucky) ----
 print("\n[7] apk 安装库里的关键包")
 db = rd("/lib/apk/db/installed") or ""
 pkgs = {}
@@ -298,10 +298,40 @@ for line in db.splitlines():
         k, v = line.split(":", 1)
         cur[k] = v
 for name in sorted(pkgs):
-    if re.search(r"(liuli|lucky)", name):
+    if re.search(r"(argon|lucky|upnp|miniupnpd)", name):
         print(f"      {name} = {pkgs[name]}")
-for need in ("luci-theme-liuli", "luci-app-liuli", "lucky", "luci-app-lucky"):
+for need in ("luci-theme-argon", "luci-app-upnp", "lucky", "luci-app-lucky"):
     chk(need in pkgs, f"已安装 {need}", pkgs.get(need, ""))
+
+# ---- 8. 已下线插件必须不在镜像里 (2026-10-22 清理) ----
+# 配置里删了不等于镜像里没有: 依赖解析可能把它们带回来, 所以按文件/包双查。
+print("\n[8] 已下线插件复查 (liuli / smartdns / lxc / wireguard / msd_lite)")
+GONE_PATHS = [
+    "/usr/share/ucode/luci/template/themes/liuli",
+    "/www/luci-static/liuli",
+    "/www/luci-static/resources/view/liuli",
+    "/usr/share/rpcd/ucode/luci.liuli",
+    "/usr/share/rpcd/ucode/luci.liuli-theme",
+    "/etc/config/liuli",
+    "/etc/config/smartdns",
+    "/etc/config/lxc",
+    "/etc/config/upnpd.disabled",   # 占位, 不会存在
+]
+leftover = [p for p in GONE_PATHS if p in files]
+for p in GONE_PATHS:
+    if p in files:
+        print(f"      !! 残留 {p}")
+chk(not leftover, f"liuli/smartdns/lxc 文件路径残留 {len(leftover)} 处")
+
+GONE_PKGS = ["luci-theme-liuli", "luci-app-liuli", "smartdns", "luci-app-smartdns",
+             "lxc", "luci-app-lxc", "rpcd-mod-lxc", "liblxc",
+             "wireguard-tools", "luci-proto-wireguard", "kmod-wireguard",
+             "msd_lite", "luci-app-msd_lite"]
+revived = [k for k in GONE_PKGS if k in pkgs]
+for k in GONE_PKGS:
+    if k in pkgs:
+        print(f"      !! 已安装 {k} = {pkgs[k]}")
+chk(not revived, f"已下线包复活 {len(revived)} 个")
 
 print("\n" + "=" * 64)
 if FAIL:
@@ -309,5 +339,5 @@ if FAIL:
     for f in FAIL:
         print("   -", f)
     sys.exit(1)
-print("独立复验全部通过 ✓  (崩溃根因已消除, liuli 为默认主题, lucky 在位)")
+print("独立复验全部通过 ✓  (无未注册调用/无逆序正则, Argon 为默认主题, lucky+UPnP 在位)")
 print("=" * 64)

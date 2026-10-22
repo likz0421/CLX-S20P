@@ -56,7 +56,7 @@ jobs:
         python3 -m pip install --break-system-packages PySquashfsImage
 
     # =========================================================
-    # 2. 签出本仓库(含 liuli 主题/看板源码)
+    # 2. 签出本仓库(含 25.12/ 构建配置与脚本)
     # =========================================================
     - name: Checkout
       uses: actions/checkout@v5
@@ -64,8 +64,8 @@ jobs:
     - name: Show workspace
       run: |
         ls -la "$GITHUB_WORKSPACE"
-        echo "liuli 主题模板:"
-        ls -la "$GITHUB_WORKSPACE/luci-theme-liuli/ucode/template/themes/liuli/"
+        echo "仓库内容:"
+        ls -la "$GITHUB_WORKSPACE/25.12/"
 
     # =========================================================
     # 3. 克隆 ImmortalWrt 25.12 源码
@@ -79,7 +79,7 @@ jobs:
         echo "上游提交: $(git log -1 --format='%ad %s' --date=short)"
 
     # =========================================================
-    # 4. diy-part1: feeds + liuli + lucky + 崩溃守卫
+    # 4. diy-part1: lucky + argon v3.1.0 + 崩溃守卫
     # =========================================================
     - name: Load custom feeds (diy-part1.sh)
       run: |
@@ -200,12 +200,18 @@ jobs:
 
           - 源码: `${{ env.REPO_URL }}` 分支 `${{ env.REPO_BRANCH }}`
           - 设备: `mediatek/filogic · clx_s20p · aarch64_cortex-a53`
-          - 自带: 琉璃 Liuli 主题(默认) + 琉璃看板 + Lucky
+          - 主题: Argon (jerrykuku/luci-theme-argon v3.1.0, 默认)
+          - 插件: Lucky + UPnP
+          - 已移除: 琉璃 Liuli、SmartDNS、LXC、WireGuard、组播转换 (msd_lite)
 
-          ### 本次修复
-          - 修复 LuCI 登录页 500 (`left-hand side is not a function`):
-            ucode 全局函数表里没有 `String()`, 琉璃模板调用它即崩溃。
-            已改为模板字面量 `liuli_str()` helper, 并在构建期加了守卫。
+          ### 构建期防线
+          - 未注册函数守卫: ucode 全局函数表只有 71 个内置, 没有
+            `String()`/`Number()`/`unixtime()`/`parseInt()` 等;
+            覆盖 `.ut` 模板 + `.uc` 控制器 + rpcd 脚本三类源码
+          - POSIX ERE 守卫: ucode 的 `match()` 走 glibc `regcomp`,
+            括号表达式内的反斜杠不是转义符, `[A-Za-z0-9\-.]` 会变成
+            逆序范围 -> `REG_ERANGE` -> "Invalid character range"
+          - 出厂固件取证: 编译完成后拆 rootfs 逐条复验
         files: |
           openwrt/bin/targets/mediatek/filogic/*
           openwrt/config.buildinfo

@@ -218,9 +218,18 @@ print("\n[2] Argon 主题 (jerrykuku v3.1.0)")
 ARGON_TPL = ("footer.ut", "head.ut", "header.ut", "page_scripts.ut", "sysauth.ut",
              "head_meta.ut", "footer_login.ut", "header_login.ut",
              "login_background.ut", "login_form.ut", "out_header_login.ut")
+argon_missing = []
 for name in ARGON_TPL:
     p = f"/usr/share/ucode/luci/template/themes/argon/{name}"
-    chk(p in files, f"模板 {name}")
+    ok = p in files
+    chk(ok, f"模板 {name}")
+    if not ok:
+        argon_missing.append(name)
+if argon_missing:
+    real = sorted(p for p in files
+                  if p.startswith("/usr/share/ucode/luci/template/themes/argon/"))
+    print(f"      [诊断] 实际存在的 argon 模板 ({len(real)} 个): "
+          + ", ".join(x.rsplit("/", 1)[-1] for x in real))
 hdr = rd("/usr/share/ucode/luci/template/themes/argon/head.ut") or ""
 chk(len(hdr) > 500, "head.ut 非空", f"{len(hdr)} chars")
 chk(not re.search(r"(?<![\w$.])String\s*\(", hdr), "head.ut 无裸 String()")
@@ -236,15 +245,53 @@ for p, label in [("/www/luci-static/resources/view/argon-config.js", "Argon 设�
     chk(p in files, label, p)
 
 # ---- 2b. UPnP + Lucky (2026-10-22 清理后仅保留的两个插件) ----
+# 页面文件名不硬编码: luci-app-upnp 的 view 叫 upnp.js(stock 稳定)但也可能是
+# 别的名字, 上一轮就是因为写死 status.js 而误报。改成按目录 glob, 只要目录里
+# 有 .js 就算在位, 并把实际文件打出来便于核对。
 print("\n[2b] UPnP 与 Lucky")
 for p, label in [("/usr/sbin/miniupnpd", "miniupnpd 守护进程"),
                  ("/etc/config/upnpd", "UPnP 配置"),
-                 ("/www/luci-static/resources/view/upnp/status.js", "UPnP LuCI 页面"),
                  ("/usr/bin/lucky", "lucky 核心二进制"),
                  ("/etc/config/lucky", "lucky 配置"),
-                 ("/etc/init.d/lucky", "lucky 启动脚本"),
-                 ("/www/luci-static/resources/view/lucky/config-3_0_0-26.js", "lucky LuCI 页面")]:
+                 ("/etc/init.d/lucky", "lucky 启动脚本")]:
     chk(p in files, label, p)
+
+
+def js_in(prefix):
+    """该目录下(递归)的 .js 全部列出来"""
+    return sorted(p for p in files if p.startswith(prefix) and p.endswith(".js"))
+
+
+def diagnose(keyword):
+    """查不到时把所有含该关键字的路径打出来, 让失败日志自己说明真相。
+    上一轮硬编码 view/upnp/status.js 结果真实文件叫 upnp.js, 因为没有任何
+    诊断信息, 只能靠猜; 这次让脚本自己交代。"""
+    hits = sorted(p for p in files
+                  if keyword in p.lower() and p.startswith("/www/luci-static/resources/"))
+    print(f"      [诊断] /www/luci-static/resources/ 下含 '{keyword}' 的路径 "
+          f"({len(hits)} 个):")
+    for h in hits[:12]:
+        print(f"             {h}")
+    if not hits:
+        print("             (无 — 说明该插件的 LuCI 页面没被打进镜像)")
+
+
+upnp_js = js_in("/www/luci-static/resources/view/upnp/")
+chk(len(upnp_js) > 0, "UPnP LuCI 页面在 view/upnp/ 下", ", ".join(upnp_js[:4]) or "(空)")
+if not upnp_js:
+    diagnose("upnp")
+
+upnp_status_hit = [p for p in js_in("/www/luci-static/resources/view/status/include/")
+                   if "upnp" in p.lower()]
+chk(len(upnp_status_hit) > 0, "UPnP 状态页 include",
+    ", ".join(upnp_status_hit[:3]) or "(空)")
+if not upnp_status_hit:
+    diagnose("upnp")
+
+lucky_js = js_in("/www/luci-static/resources/view/lucky/")
+chk(len(lucky_js) > 0, "lucky LuCI 页面在 view/lucky/ 下", ", ".join(lucky_js[:4]) or "(空)")
+if not lucky_js:
+    diagnose("lucky")
 
 # ---- 3. 默认主题必须是 Argon ----
 print("\n[3] 默认主题 (Argon)")

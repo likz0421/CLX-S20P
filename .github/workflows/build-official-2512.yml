@@ -162,19 +162,29 @@ jobs:
       run: |
         cd openwrt
         set -eo pipefail
-        BIN=$(find bin/targets/mediatek/filogic -name "*clx_s20p-squashfs-sysupgrade.bin" | head -1)
+        # 放宽匹配: 不再硬编码 squashfs。旧实现一旦文件名对不上就直接 exit 1,
+        # 报告文件根本没生成, 本地永远拿不到诊断 —— 这是之前一直看不到
+        # verify 真实报错的原因之一。现在找不到固件也要把目录实况回写。
+        BIN=$(find bin/targets/mediatek/filogic -name "*clx_s20p*sysupgrade*.bin" | head -1)
+        RC=0
         if [ -z "$BIN" ]; then
           echo "::error::未找到 sysupgrade 固件"
-          find bin/targets -maxdepth 2 -type f | head -20
-          exit 1
+          {
+            echo "## 未找到 sysupgrade 固件 — bin/targets 实况"
+            echo
+            find bin/targets -maxdepth 3 -type f | head -40
+            echo
+            echo "(查找模式: *clx_s20p*sysupgrade*.bin)"
+          } > /tmp/verify.log
+          RC=1
+        else
+          echo "待验证固件: $BIN  ($(stat -c%s "$BIN") bytes)"
+          # 唯一事实源: 与本地 official-25.12/verify-firmware.py 同一个文件, 规则不会漂移
+          set +e
+          python3 "$GITHUB_WORKSPACE/official-25.12/verify-firmware.py" "$BIN" 2>&1 | tee /tmp/verify.log
+          RC=${PIPESTATUS[0]}
+          set -e
         fi
-        echo "待验证固件: $BIN  ($(stat -c%s "$BIN") bytes)"
-        # 唯一事实源: 与本地 official-25.12/verify-firmware.py 同一个文件, 规则不会漂移
-        # 自行把报告回写 commit comment, 不依赖后续步骤
-        set +e
-        python3 "$GITHUB_WORKSPACE/official-25.12/verify-firmware.py" "$BIN" 2>&1 | tee /tmp/verify.log
-        RC=${PIPESTATUS[0]}
-        set -e
         set +e
         if [ -s /tmp/verify.log ]; then
           {

@@ -146,40 +146,43 @@ jobs:
 
     # 失败取证: 把编译错误上下文 / verify 报告回写到 commit comment
     # (经 api.github.com, 绕过被代理拦截的 blob 日志下载), 本地才能读到真实结果。
+    # 关键: verify 报告独立成帖, 绝不附加在编译噪声后面, 否则会被 64KB 上限截断。
     - name: Surface reports to commit comment
       if: always()
       env:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
         cd openwrt
-        {
-          if [ -f build.log ] && grep -qE "error:|Error 1|make: \*\*\*|recipe for target|ERROR:" build.log; then
-            echo "## Build error context (run ${{ github.run_id }})"
+        post_report() {
+          local title="$1"; local file="$2"; local n="${3:-400}"
+          [ -f "$file" ] || return 0
+          {
+            echo "## $title (run ${{ github.run_id }})"
             echo
             echo '```'
-            grep -nE "error:|Error 1|make: \*\*\*|recipe for target|ERROR:" -B3 -A20 build.log | tail -220
+            tail -n "$n" "$file"
             echo '```'
-            echo
-          fi
-          if [ -f /tmp/verify.log ]; then
-            echo "## Verify report (run ${{ github.run_id }})"
-            echo
-            echo '```'
-            tail -280 /tmp/verify.log
-            echo '```'
-          fi
-        } > /tmp/report.md
-        [ -s /tmp/report.md ] || { echo "nothing to surface"; exit 0; }
-        python3 - <<'PY'
-        import json, os, subprocess
-        body = open('/tmp/report.md').read()
-        r = subprocess.run(
-            ['gh', 'api', '-X', 'POST',
-             f"repos/{os.environ['GITHUB_REPOSITORY']}/commits/{os.environ['GITHUB_SHA']}/comments",
-             '--input', '-'],
-            input=json.dumps({"body": body}).encode(), check=False)
-        print("post rc=", r.returncode)
-        PY
+          } > /tmp/sec.md
+          python3 - "$title" <<'PY'
+          import json, os, subprocess, sys
+          title = sys.argv[1]
+          body = open('/tmp/sec.md').read()
+          r = subprocess.run(
+              ['gh', 'api', '-X', 'POST',
+               f"repos/{os.environ['GITHUB_REPOSITORY']}/commits/{os.environ['GITHUB_SHA']}/comments",
+               '--input', '-'],
+              input=json.dumps({"body": body}).encode(), check=False)
+          print(f"post[{title}] rc=", r.returncode)
+          PY
+        }
+        # 1) verify 报告优先, 单独成帖
+        [ -f /tmp/verify.log ] && post_report "Verify report" /tmp/verify.log 400
+        # 2) 仅当编译真失败时才精炼报错 (排除 (ignored) 等无害行), 独立成帖
+        if [ -f build.log ] && grep -qE "make: \*\*\*|fatal error:|undefined reference" build.log; then
+          grep -nE "error:|Error 1|make: \*\*\*|recipe for target|fatal error|undefined reference" -B2 -A15 build.log \
+            | grep -v "(ignored)" | tail -n 200 > /tmp/berr.log
+          post_report "Build error context" /tmp/berr.log 200
+        fi
 
     # =========================================================
     # 8. ★ 出厂固件取证验证 ★

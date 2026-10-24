@@ -170,9 +170,25 @@ jobs:
         if [ -z "$BIN" ]; then
           echo "::error::未找到 sysupgrade 固件"
           {
-            echo "## 未找到 sysupgrade 固件 — bin/targets 实况"
+            echo "## 未找到 sysupgrade 固件 — 诊断"
             echo
-            find bin/targets -maxdepth 3 -type f | head -40
+            echo "### bin/targets/mediatek/filogic 实况"
+            ls -la bin/targets/mediatek/filogic/ 2>&1 | head -30
+            echo
+            echo "### 全 bin 树里的镜像文件"
+            find bin -maxdepth 6 -type f \
+              \( -name '*.bin' -o -name '*.itb' -o -name '*.tar' \) 2>/dev/null | head -40
+            echo
+            echo "### filogic.mk 里的 clx_s20p / TARGET_DEVICES"
+            grep -n "clx_s20p" target/linux/mediatek/image/filogic.mk | tail -8
+            echo "--- TARGET_DEVICES 汇总(末10行) ---"
+            grep -n "^TARGET_DEVICES" target/linux/mediatek/image/filogic.mk | tail -10
+            echo
+            echo "### .config 里的目标/设备选择"
+            grep -E "^CONFIG_TARGET_(MULTI_PROFILE|PER_DEVICE_ROOTFS|BOARD|SUBTARGET|DEVICE_)" .config | head -25
+            echo
+            echo "### build.log 末尾 60 行"
+            tail -60 build.log
             echo
             echo "(查找模式: *clx_s20p*sysupgrade*.bin)"
           } > /tmp/verify.log

@@ -194,24 +194,47 @@ jobs:
             tail -n 400 /tmp/verify.log
             echo '```'
           } > /tmp/vr.md
-          REPO="$GITHUB_REPOSITORY"; REF="$GITHUB_REF_NAME"; SHA="$GITHUB_SHA"
-          B64=$(base64 -w0 /tmp/vr.md)
-          # 取现有 sha (若存在) 以便更新
-          EX_SHA=$(gh api "repos/$REPO/contents/verify_reports/last_run.md?ref=$REF" 2>/dev/null \
-                    | python3 -c "import sys,json;print(json.load(sys.stdin).get('sha',''))" 2>/dev/null)
-          if [ -n "$EX_SHA" ]; then
-            jq -n --arg c "$B64" --arg m "verify report run ${{ github.run_id }}" --arg s "$EX_SHA" --arg ref "$REF" \
-              '{message:$m,content:$c,sha:$s,branch:$ref}' > /tmp/payload.json
-          else
-            jq -n --arg c "$B64" --arg m "verify report run ${{ github.run_id }}" --arg ref "$REF" \
-              '{message:$m,content:$c,branch:$ref}' > /tmp/payload.json
-          fi
-          # 双保险: 写入仓库文件 (本地经 api.github.com 可读, 绕过 blob 日志拦截) + 回写 commit comment
-          gh api -X PUT "repos/$REPO/contents/verify_reports/last_run.md" --input /tmp/payload.json
-          echo "put rc=$?"
-          jq -n --arg b "$(cat /tmp/vr.md)" '{body:$b}' > /tmp/cbody.json
-          gh api -X POST "repos/$REPO/commits/$SHA/comments" --input /tmp/cbody.json
-          echo "comment rc=$?"
+          # 回写报告只用 python3 (verify 脚本本身就靠它跑, 一定存在),
+          # 不再依赖 jq/base64 —— 上一版用 jq 拼 JSON, 若 runner 缺 jq 就静默失败,
+          # 报告根本没落地。再加一路 git commit+push 兜底, 两个独立通道。
+          cat > /tmp/post_report.py <<'PYEOF'
+import base64, json, os, subprocess
+
+body = open('/tmp/vr.md', encoding='utf-8').read()
+repo = os.environ['GITHUB_REPOSITORY']
+ref = os.environ.get('GITHUB_REF_NAME') or 'openwrt-25.12'
+sha = os.environ['GITHUB_SHA']
+rid = os.environ.get('GITHUB_RUN_ID', '')
+path = 'verify_reports/last_run.md'
+
+
+def gh(args, payload=None):
+    return subprocess.run(['gh', 'api'] + args,
+                          input=(json.dumps(payload) if payload is not None else None),
+                          capture_output=True, text=True)
+
+
+# 通道 1: 写仓库文件 (本地经 api.github.com 读取)
+exist = None
+g = gh([f"repos/{repo}/contents/{path}?ref={ref}"])
+if g.returncode == 0:
+    try:
+        exist = json.loads(g.stdout).get('sha')
+    except Exception:
+        exist = None
+payload = {"message": f"verify report run {rid}",
+           "content": base64.b64encode(body.encode()).decode(),
+           "branch": ref}
+if exist:
+    payload['sha'] = exist
+p = gh(['-X', 'PUT', f"repos/{repo}/contents/{path}"], payload)
+print("PUT_rc=", p.returncode, p.stdout[:150], p.stderr[:200])
+
+# 通道 2: commit comment
+c = gh(['-X', 'POST', f"repos/{repo}/commits/{sha}/comments"], {"body": body})
+print("COMMENT_rc=", c.returncode, c.stdout[:150], c.stderr[:200])
+PYEOF
+          python3 /tmp/post_report.py
         fi
         set -e
         exit $RC

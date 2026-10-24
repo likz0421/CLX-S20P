@@ -144,52 +144,21 @@ jobs:
         path: ~/.ccache
         key: ccache-official-2512-${{ github.run_id }}
 
-    # 失败取证: 把编译错误上下文 / verify 报告回写到 commit comment
-    # (经 api.github.com, 绕过被代理拦截的 blob 日志下载), 本地才能读到真实结果。
-    # 关键: verify 报告独立成帖, 绝不附加在编译噪声后面, 否则会被 64KB 上限截断。
-    - name: Surface reports to commit comment
-      if: always()
-      env:
-        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      run: |
-        cd openwrt
-        post_report() {
-          local title="$1"; local file="$2"; local n="${3:-400}"
-          [ -f "$file" ] || return 0
-          {
-            echo "## $title (run ${{ github.run_id }})"
-            echo
-            echo '```'
-            tail -n "$n" "$file"
-            echo '```'
-          } > /tmp/sec.md
-          python3 - "$title" <<'PY'
-          import json, os, subprocess, sys
-          title = sys.argv[1]
-          body = open('/tmp/sec.md').read()
-          r = subprocess.run(
-              ['gh', 'api', '-X', 'POST',
-               f"repos/{os.environ['GITHUB_REPOSITORY']}/commits/{os.environ['GITHUB_SHA']}/comments",
-               '--input', '-'],
-              input=json.dumps({"body": body}).encode(), check=False)
-          print(f"post[{title}] rc=", r.returncode)
-          PY
-        }
-        # 1) verify 报告优先, 单独成帖
-        [ -f /tmp/verify.log ] && post_report "Verify report" /tmp/verify.log 400
-        # 2) 仅当编译真失败时才精炼报错 (排除 (ignored) 等无害行), 独立成帖
-        if [ -f build.log ] && grep -qE "make: \*\*\*|fatal error:|undefined reference" build.log; then
-          grep -nE "error:|Error 1|make: \*\*\*|recipe for target|fatal error|undefined reference" -B2 -A15 build.log \
-            | grep -v "(ignored)" | tail -n 200 > /tmp/berr.log
-          post_report "Build error context" /tmp/berr.log 200
-        fi
+    # 取证步骤已重构:
+    #   * verify 报告由下方 "Verify built firmware" 步骤**自行**回写 commit comment
+    #     (不依赖后续步骤, 也不会被前面的步骤失败而跳过);
+    #   * 编译错误回写移至 Verify 之后 (continue-on-error, 永不阻塞 verify)。
 
     # =========================================================
     # 8. ★ 出厂固件取证验证 ★
     #    不信任"编译成功", 直接把 rootfs 拆开逐条核对。
     #    这是唯一能证明"改动真的进固件了"的手段。
+    #    验证脚本同时把完整报告回写到 commit comment (经 api.github.com,
+    #    绕过被代理拦截的 blob 日志下载), 本地才能读到真实结果。
     # =========================================================
     - name: Verify built firmware (rootfs forensics)
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
         cd openwrt
         set -eo pipefail
@@ -201,8 +170,63 @@ jobs:
         fi
         echo "待验证固件: $BIN  ($(stat -c%s "$BIN") bytes)"
         # 唯一事实源: 与本地 official-25.12/verify-firmware.py 同一个文件, 规则不会漂移
-        # tee 到 /tmp/verify.log 供失败取证步骤回写 (绕过被拦截的 blob 日志下载)
+        # 自行把报告回写 commit comment, 不依赖后续步骤
+        set +e
         python3 "$GITHUB_WORKSPACE/official-25.12/verify-firmware.py" "$BIN" 2>&1 | tee /tmp/verify.log
+        RC=${PIPESTATUS[0]}
+        set -e
+        if [ -s /tmp/verify.log ]; then
+          {
+            echo "## Verify report (run ${{ github.run_id }})"
+            echo
+            echo '```'
+            tail -n 400 /tmp/verify.log
+            echo '```'
+          } > /tmp/vr.md
+          python3 - <<'PY'
+          import json, os, subprocess
+          body = open('/tmp/vr.md').read()
+          r = subprocess.run(
+              ['gh', 'api', '-X', 'POST',
+               f"repos/{os.environ['GITHUB_REPOSITORY']}/commits/{os.environ['GITHUB_SHA']}/comments",
+               '--input', '-'],
+              input=json.dumps({"body": body}).encode(), check=False)
+          print("post rc=", r.returncode)
+          PY
+        fi
+        exit $RC
+
+    # 编译失败时才回写精炼报错 (排除 (ignored) 等无害行); continue-on-error 永不阻塞 verify
+    - name: Surface compile error to commit comment
+      if: always()
+      continue-on-error: true
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        cd openwrt
+        if [ -f build.log ] && grep -qE "make: \*\*\*|fatal error:|undefined reference" build.log; then
+          grep -nE "error:|Error 1|make: \*\*\*|recipe for target|fatal error|undefined reference" -B2 -A15 build.log \
+            | grep -v "(ignored)" | tail -n 200 > /tmp/berr.log
+          {
+            echo "## Build error context (run ${{ github.run_id }})"
+            echo
+            echo '```'
+            cat /tmp/berr.log
+            echo '```'
+          } > /tmp/sec.md
+          python3 - <<'PY'
+          import json, os, subprocess
+          body = open('/tmp/sec.md').read()
+          r = subprocess.run(
+              ['gh', 'api', '-X', 'POST',
+               f"repos/{os.environ['GITHUB_REPOSITORY']}/commits/{os.environ['GITHUB_SHA']}/comments",
+               '--input', '-'],
+              input=json.dumps({"body": body}).encode(), check=False)
+          print("post rc=", r.returncode)
+          PY
+        else
+          echo "compile 未检测到硬错误, 跳过"
+        fi
 
     # =========================================================
     # 9. 整理 & 上传产物

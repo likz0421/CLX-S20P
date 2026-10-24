@@ -4,6 +4,9 @@
 #
 set -eo pipefail
 
+# 开启 ccache, 加速后续重编译 (GitHub cache 在 workflow 里持久化 ~/.ccache)
+echo 'CONFIG_CCACHE=y' >> .config
+
 echo "==================== diy-part2 (official 25.12.6): 开始 ===================="
 
 # ---------------------------------------------------------

@@ -18,6 +18,12 @@ grep -E "^CONFIG_VERSION_(DIST|NUMBER|CODE)=" .config || true
 #    先快照, 之后才能发现哪些包被静默丢掉
 # ---------------------------------------------------------
 cp .config .config.pre-defconfig
+
+# 清除官方 feeds 里的 weechat 递归依赖 (luci-app-weechat <-> weechat-full/minimal),
+# 否则 make defconfig 报 "recursive dependency detected" 并误丢一批包 (含 wpad-openssl 等)
+rm -rf package/feeds/packages/net/weechat \
+       package/feeds/luci/applications/luci-app-weechat 2>/dev/null || true
+
 make defconfig
 
 echo "-------------------- 配置裁剪报告 --------------------"
@@ -62,11 +68,11 @@ for pkg in luci-theme-argon luci-app-upnp lucky luci-app-lucky \
 	fi
 done
 
-# luci 本体必须存在(否则整个 Web 界面没有)
-if grep -qE "^CONFIG_PACKAGE_(luci|luci-light)=[ym]" .config; then
-	echo "  [OK]      luci 集合已选中"
+# luci 本体 + Web 服务器必须存在 (luci-light 会拉入 luci-base + uhttpd)
+if grep -qE "^CONFIG_PACKAGE_luci-base=y" .config && grep -qE "^CONFIG_PACKAGE_uhttpd=y" .config; then
+	echo "  [OK]      luci-base + uhttpd 已选中 (Web 界面可用)"
 else
-	echo "  [MISSING] luci 集合 —— Web 界面不会被编入"
+	echo "  [MISSING] luci-base/uhttpd 未入选 —— Web 界面不会被编入"
 	MISSING=1
 fi
 

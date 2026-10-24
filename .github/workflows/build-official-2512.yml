@@ -118,16 +118,48 @@ jobs:
         cd openwrt
         echo "可用线程: $(nproc)"
         # 并行失败时用单线程重试定位真实错误; 两次都失败必须让步骤红掉,
-        # 绝不能让 echo 吃掉退出码
-        if make -j$(nproc) V=s; then
+        # 绝不能让 echo 吃掉退出码。全程 tee 到 build.log 供失败步骤取证。
+        if make -j$(nproc) V=s 2>&1 | tee build.log; then
           echo "首次并行编译成功"
-        elif make -j1 V=s; then
+        elif make -j1 V=s 2>&1 | tee -a build.log; then
           echo "单线程重试编译成功"
         else
           echo "::error::编译失败 (并行与单线程均失败)"
           exit 1
         fi
         echo "status=success" >> $GITHUB_OUTPUT
+
+    # 失败取证: 把编译错误上下文回写到 commit comment (经 api.github.com,
+    # 绕过被代理拦截的 blob 日志下载), 本地才能读到真实错误而非靠猜。
+    - name: Surface build error to commit comment
+      if: failure()
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        cd openwrt
+        [ -f build.log ] || { echo "no build.log"; exit 0; }
+        if grep -qE "error:|Error 1|make: \*\*\*|recipe for target|ERROR:" build.log; then
+          ERR=$(grep -nE "error:|Error 1|make: \*\*\*|recipe for target|ERROR:" -B3 -A20 build.log | tail -240)
+        else
+          ERR=$(tail -240 build.log)
+        fi
+        {
+          echo "## Build failed — compile error context (run ${{ github.run_id }})"
+          echo
+          echo '```'
+          echo "$ERR"
+          echo '```'
+        } > /tmp/err.md
+        python3 - <<'PY'
+        import json, os, subprocess
+        body = open('/tmp/err.md').read()
+        r = subprocess.run(
+            ['gh', 'api', '-X', 'POST',
+             f"repos/{os.environ['GITHUB_REPOSITORY']}/commits/{os.environ['GITHUB_SHA']}/comments",
+             '--input', '-'],
+            input=json.dumps({"body": body}).encode(), check=False)
+        print("post rc=", r.returncode)
+        PY
 
     # =========================================================
     # 8. ★ 出厂固件取证验证 ★

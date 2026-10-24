@@ -197,44 +197,10 @@ jobs:
           # 回写报告只用 python3 (verify 脚本本身就靠它跑, 一定存在),
           # 不再依赖 jq/base64 —— 上一版用 jq 拼 JSON, 若 runner 缺 jq 就静默失败,
           # 报告根本没落地。再加一路 git commit+push 兜底, 两个独立通道。
-          cat > /tmp/post_report.py <<'PYEOF'
-import base64, json, os, subprocess
-
-body = open('/tmp/vr.md', encoding='utf-8').read()
-repo = os.environ['GITHUB_REPOSITORY']
-ref = os.environ.get('GITHUB_REF_NAME') or 'openwrt-25.12'
-sha = os.environ['GITHUB_SHA']
-rid = os.environ.get('GITHUB_RUN_ID', '')
-path = 'verify_reports/last_run.md'
-
-
-def gh(args, payload=None):
-    return subprocess.run(['gh', 'api'] + args,
-                          input=(json.dumps(payload) if payload is not None else None),
-                          capture_output=True, text=True)
-
-
-# 通道 1: 写仓库文件 (本地经 api.github.com 读取)
-exist = None
-g = gh([f"repos/{repo}/contents/{path}?ref={ref}"])
-if g.returncode == 0:
-    try:
-        exist = json.loads(g.stdout).get('sha')
-    except Exception:
-        exist = None
-payload = {"message": f"verify report run {rid}",
-           "content": base64.b64encode(body.encode()).decode(),
-           "branch": ref}
-if exist:
-    payload['sha'] = exist
-p = gh(['-X', 'PUT', f"repos/{repo}/contents/{path}"], payload)
-print("PUT_rc=", p.returncode, p.stdout[:150], p.stderr[:200])
-
-# 通道 2: commit comment
-c = gh(['-X', 'POST', f"repos/{repo}/commits/{sha}/comments"], {"body": body})
-print("COMMENT_rc=", c.returncode, c.stdout[:150], c.stderr[:200])
-PYEOF
-          python3 /tmp/post_report.py
+          # 回写报告用仓库里的独立脚本 post_report.py, 不在 YAML 里嵌 heredoc:
+          # YAML 字面块中出现顶格行会直接破坏结构; 而缩进的 heredoc 终结符
+          # 在 bash 下又不可靠 —— 之前几版报告"静默不落地"就是这么来的。
+          python3 "$GITHUB_WORKSPACE/official-25.12/post_report.py"
         fi
         set -e
         exit $RC

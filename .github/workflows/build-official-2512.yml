@@ -57,6 +57,14 @@ jobs:
         sudo apt-get clean
         python3 -m pip install --break-system-packages PySquashfsImage
 
+    - name: Restore ccache
+      uses: actions/cache@v4
+      with:
+        path: ~/.ccache
+        key: ccache-official-2512-${{ github.run_id }}
+        restore-keys: |
+          ccache-official-2512-
+
     # =========================================================
     # 2. 签出本仓库(含 official-25.12/ 构建配置与脚本)
     # =========================================================
@@ -129,30 +137,42 @@ jobs:
         fi
         echo "status=success" >> $GITHUB_OUTPUT
 
-    # 失败取证: 把编译错误上下文回写到 commit comment (经 api.github.com,
-    # 绕过被代理拦截的 blob 日志下载), 本地才能读到真实错误而非靠猜。
-    - name: Surface build error to commit comment
-      if: failure()
+    - name: Save ccache
+      if: always()
+      uses: actions/cache@v4
+      with:
+        path: ~/.ccache
+        key: ccache-official-2512-${{ github.run_id }}
+
+    # 失败取证: 把编译错误上下文 / verify 报告回写到 commit comment
+    # (经 api.github.com, 绕过被代理拦截的 blob 日志下载), 本地才能读到真实结果。
+    - name: Surface reports to commit comment
+      if: always()
       env:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
         cd openwrt
-        [ -f build.log ] || { echo "no build.log"; exit 0; }
-        if grep -qE "error:|Error 1|make: \*\*\*|recipe for target|ERROR:" build.log; then
-          ERR=$(grep -nE "error:|Error 1|make: \*\*\*|recipe for target|ERROR:" -B3 -A20 build.log | tail -240)
-        else
-          ERR=$(tail -240 build.log)
-        fi
         {
-          echo "## Build failed — compile error context (run ${{ github.run_id }})"
-          echo
-          echo '```'
-          echo "$ERR"
-          echo '```'
-        } > /tmp/err.md
+          if [ -f build.log ] && grep -qE "error:|Error 1|make: \*\*\*|recipe for target|ERROR:" build.log; then
+            echo "## Build error context (run ${{ github.run_id }})"
+            echo
+            echo '```'
+            grep -nE "error:|Error 1|make: \*\*\*|recipe for target|ERROR:" -B3 -A20 build.log | tail -220
+            echo '```'
+            echo
+          fi
+          if [ -f /tmp/verify.log ]; then
+            echo "## Verify report (run ${{ github.run_id }})"
+            echo
+            echo '```'
+            tail -280 /tmp/verify.log
+            echo '```'
+          fi
+        } > /tmp/report.md
+        [ -s /tmp/report.md ] || { echo "nothing to surface"; exit 0; }
         python3 - <<'PY'
         import json, os, subprocess
-        body = open('/tmp/err.md').read()
+        body = open('/tmp/report.md').read()
         r = subprocess.run(
             ['gh', 'api', '-X', 'POST',
              f"repos/{os.environ['GITHUB_REPOSITORY']}/commits/{os.environ['GITHUB_SHA']}/comments",
@@ -178,7 +198,8 @@ jobs:
         fi
         echo "待验证固件: $BIN  ($(stat -c%s "$BIN") bytes)"
         # 唯一事实源: 与本地 official-25.12/verify-firmware.py 同一个文件, 规则不会漂移
-        python3 "$GITHUB_WORKSPACE/official-25.12/verify-firmware.py" "$BIN"
+        # tee 到 /tmp/verify.log 供失败取证步骤回写 (绕过被拦截的 blob 日志下载)
+        python3 "$GITHUB_WORKSPACE/official-25.12/verify-firmware.py" "$BIN" 2>&1 | tee /tmp/verify.log
 
     # =========================================================
     # 9. 整理 & 上传产物

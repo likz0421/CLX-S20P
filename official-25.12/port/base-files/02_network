@@ -1,0 +1,16 @@
+# CLX-S20P network defaults for OpenWrt 25.12
+#
+# This is a *case entry* for the mediatek_setup_interfaces() function inside
+# target/linux/mediatek/filogic/base-files/etc/board.d/02_network.
+# apply.sh inserts it right after the function's `case $board in` line.
+#
+# Port mapping (from the vendor device tree):
+#   WAN  : eth1 = gmac1 (mac@1), 2500base-x via phy7     -> 2.5G WAN
+#   LAN  : lan1..lan6 = MT7531 switch port@0..4 + port@5 (phy5), CPU = gmac0
+# MAC addresses are NOT set here: the DTS already provides them through nvmem
+# (gmac0 <- macaddr_factory_2a, gmac1 <- macaddr_factory_24) plus the
+# label-mac-device alias, so board.d does not need mediatek_setup_macs.
+
+clx,s20p)
+	ucidef_set_interfaces_lan_wan "lan1 lan2 lan3 lan4 lan5 lan6" eth1
+	;;

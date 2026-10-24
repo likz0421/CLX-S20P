@@ -1,0 +1,18 @@
+# CLX-S20P LED defaults for OpenWrt 25.12
+#
+# Top-level `case $board in` entry for
+# target/linux/mediatek/filogic/base-files/etc/board.d/01_leds
+# (official's filogic 01_leds is a flat script, not a function — apply.sh
+#  inserts this after its first `case $board in`).
+#
+# From the vendor device tree — only three GPIO LEDs exist:
+#   wlan5g : pio 2    wlan2g : pio 1    sys : pio 22
+# `sys` is deliberately left alone: the DTS aliases map
+# led-boot / led-running / led-upgrade / led-failsafe onto /leds/led_sys, so
+# the kernel already drives it as the system status LED. Attaching a netdev
+# trigger to it here would fight that alias.
+
+clx,s20p)
+	ucidef_set_led_wlan "wlan2g" "WLAN2G" "wlan2g" "phy0-ap0"
+	ucidef_set_led_wlan "wlan5g" "WLAN5G" "wlan5g" "phy1-ap0"
+	;;

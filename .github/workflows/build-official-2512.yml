@@ -1,0 +1,233 @@
+name: CLX-S20P 官方 OpenWrt 25.12.6 (mt76)
+
+env:
+  DEVICE_NAME: clx_s20p
+  REPO_URL: https://github.com/openwrt/openwrt.git
+  REPO_BRANCH: v25.12.6
+  CONFIG_FILE: official-25.12/s20p.config
+  DIY_P1_SH: official-25.12/diy-part1.sh
+  DIY_P2_SH: official-25.12/diy-part2.sh
+  UPLOAD_BIN_DIR: false
+  UPLOAD_FIRMWARE: true
+  UPLOAD_RELEASE: true
+  TZ: Asia/Shanghai
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+on:
+  repository_dispatch:
+  workflow_dispatch:
+  schedule:
+    - cron: '13 2 * * 1'   # 每周一 02:13 北京时间重构建, 跟随官方安全更新
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+
+    steps:
+    # =========================================================
+    # 1. 释放磁盘空间 + 安装编译依赖
+    # =========================================================
+    - name: Free disk space
+      run: |
+        sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+          /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/lib/jvm
+        sudo docker image prune --all --force
+        df -hT
+
+    - name: Install build dependencies
+      env:
+        DEBIAN_FRONTEND: noninteractive
+      run: |
+        sudo apt-get update -qq
+        sudo apt-get install -y --no-install-recommends \
+          ack antlr3 asciidoc autoconf automake autopoint binutils bison build-essential \
+          bzip2 ccache clang cmake cpio curl device-tree-compiler ecj fastjar flex gawk \
+          gettext git gperf haveged help2man intltool lib32gcc-s1 libc6-dev-i386 \
+          libelf-dev libglib2.0-dev libgmp3-dev libltdl-dev libmpc-dev libmpfr-dev \
+          libncurses-dev libpython3-dev libreadline-dev libssl-dev libtool libyaml-dev \
+          libz-dev lrzsz mkisofs msmtp nano ninja-build p7zip p7zip-full patch pkgconf \
+          python3 python3-pip python3-ply python3-docutils python3-pyelftools qemu-utils \
+          re2c rsync scons squashfs-tools subversion swig texinfo uglifyjs upx-ucl unzip \
+          vim wget xmlto xxd zlib1g-dev zstd
+        sudo apt-get clean
+        python3 -m pip install --break-system-packages PySquashfsImage
+
+    # =========================================================
+    # 2. 签出本仓库(含 official-25.12/ 构建配置与脚本)
+    # =========================================================
+    - name: Checkout
+      uses: actions/checkout@v5
+
+    - name: Show workspace
+      run: |
+        ls -la "$GITHUB_WORKSPACE"
+        echo "仓库内容:"
+        ls -la "$GITHUB_WORKSPACE/official-25.12/"
+
+    # =========================================================
+    # 3. 克隆官方 OpenWrt 25.12.6 (tag)
+    # =========================================================
+    - name: Clone source code
+      run: |
+        df -hT
+        git clone "$REPO_URL" -b "$REPO_BRANCH" --single-branch --depth=1 openwrt
+        cd openwrt
+        echo "源码 HEAD: $(git rev-parse --short HEAD)"
+        echo "tag: $(git describe --tags 2>/dev/null || echo '(detached)')"
+
+    # =========================================================
+    # 4. diy-part1: 应用移植包 + lucky + argon v3.1.0 + 崩溃守卫
+    # =========================================================
+    - name: Load custom feeds (diy-part1.sh)
+      run: |
+        cd openwrt
+        chmod +x "$GITHUB_WORKSPACE/$DIY_P1_SH"
+        "$GITHUB_WORKSPACE/$DIY_P1_SH"
+
+    # =========================================================
+    # 5. diy-part2: 配置定型 + 硬校验
+    # =========================================================
+    - name: Load custom configuration (diy-part2.sh)
+      run: |
+        cd openwrt
+        [ -e "$GITHUB_WORKSPACE/$CONFIG_FILE" ] && cp "$GITHUB_WORKSPACE/$CONFIG_FILE" .config
+        chmod +x "$GITHUB_WORKSPACE/$DIY_P2_SH"
+        "$GITHUB_WORKSPACE/$DIY_P2_SH"
+
+    # =========================================================
+    # 6. 下载源码包
+    # =========================================================
+    - name: Download package sources
+      run: |
+        cd openwrt
+        make download -j$(nproc)
+        find dl -size -1024c -exec ls -l {} \;
+        find dl -size -1024c -exec rm -f {} \;
+
+    # =========================================================
+    # 7. 编译
+    # =========================================================
+    - name: Compile firmware
+      id: compile
+      run: |
+        cd openwrt
+        echo "可用线程: $(nproc)"
+        # 并行失败时用单线程重试定位真实错误; 两次都失败必须让步骤红掉,
+        # 绝不能让 echo 吃掉退出码
+        if make -j$(nproc) V=s; then
+          echo "首次并行编译成功"
+        elif make -j1 V=s; then
+          echo "单线程重试编译成功"
+        else
+          echo "::error::编译失败 (并行与单线程均失败)"
+          exit 1
+        fi
+        echo "status=success" >> $GITHUB_OUTPUT
+
+    # =========================================================
+    # 8. ★ 出厂固件取证验证 ★
+    #    不信任"编译成功", 直接把 rootfs 拆开逐条核对。
+    #    这是唯一能证明"改动真的进固件了"的手段。
+    # =========================================================
+    - name: Verify built firmware (rootfs forensics)
+      run: |
+        cd openwrt
+        set -eo pipefail
+        BIN=$(find bin/targets/mediatek/filogic -name "*clx_s20p-squashfs-sysupgrade.bin" | head -1)
+        if [ -z "$BIN" ]; then
+          echo "::error::未找到 sysupgrade 固件"
+          find bin/targets -maxdepth 2 -type f | head -20
+          exit 1
+        fi
+        echo "待验证固件: $BIN  ($(stat -c%s "$BIN") bytes)"
+        # 唯一事实源: 与本地 official-25.12/verify-firmware.py 同一个文件, 规则不会漂移
+        python3 "$GITHUB_WORKSPACE/official-25.12/verify-firmware.py" "$BIN"
+
+    # =========================================================
+    # 9. 整理 & 上传产物
+    # =========================================================
+    - name: Organize firmware files
+      id: organize
+      run: |
+        cd openwrt/bin/targets/mediatek/filogic
+        rm -rf packages
+        DATE=$(date +%Y%m%d)
+        for f in *clx_s20p*; do
+          [ -e "$f" ] || continue
+          case "$f" in
+            *sysupgrade.bin) mv "$f" "s20p-v25.12.6-${DATE}-sysupgrade.bin" ;;
+            *initramfs-kernel.bin) mv "$f" "s20p-v25.12.6-${DATE}-initramfs-kernel.bin" ;;
+          esac
+        done
+        sha256sum * > sha256sums 2>/dev/null || true
+        cp .config ../../../../config.buildinfo 2>/dev/null || true
+        echo "PACKAGE_DATE=${DATE}" >> $GITHUB_OUTPUT
+        echo "-------------------- 产物 --------------------"
+        ls -la
+        cd ../../../.. && ls -la *.buildinfo 2>/dev/null || true
+
+    - name: Upload firmware to artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: clx-s20p-25.12.6-${{ steps.organize.outputs.PACKAGE_DATE }}
+        path: openwrt/bin/targets/mediatek/filogic/
+
+    - name: Upload config.buildinfo
+      uses: actions/upload-artifact@v4
+      with:
+        name: clx-s20p-25.12.6-buildinfo
+        path: openwrt/config.buildinfo
+
+    # =========================================================
+    # 10. 发布 Release
+    # =========================================================
+    - name: Generate release tag
+      id: tag
+      run: |
+        echo "release_tag=$(date +"%Y%m%d")-official2512" >> $GITHUB_OUTPUT
+        echo "release_date=$(date +"%Y.%m.%d")" >> $GITHUB_OUTPUT
+
+    - name: Upload firmware to release
+      uses: softprops/action-gh-release@v2.3.2
+      with:
+        tag_name: ${{ steps.tag.outputs.release_tag }}
+        name: CLX-S20P v25.12.6 官方 (mt76) ${{ steps.tag.outputs.release_date }}
+        body: |
+          ## CLX-S20P — 官方 OpenWrt **25.12.6** (社区移植, 主线 mt76 WiFi)
+
+          - 源码: `openwrt/openwrt` 官方 tag **v25.12.6** (不是 ImmortalWrt 衍生分支)
+          - 设备: `mediatek/filogic · clx_s20p · aarch64_cortex-a53`
+          - 设备支持: 社区移植包 (`official-25.12/port/`, 基于厂商公开的完整 DTS)
+          - 主题: Argon (jerrykuku/luci-theme-argon v3.1.0, 默认)
+          - 插件: Lucky (v3.3.3) + UPnP
+          - 已移除: 琉璃 Liuli、SmartDNS、LXC、WireGuard、组播转换 (msd_lite)
+
+          ### WiFi 说明 (重要)
+          - 本固件使用**主线 mt76 驱动** (`kmod-mt7915e` + `mt7986-firmware`
+            + `mt7986-wo-firmware`), 与官方 `acer-w6` 等同平台设备一致。
+          - 厂商原厂固件用的是 MTK 闭源 `kmod-mt_wifi` 栈, **官方 OpenWrt 不含
+            `package/mtk`**, 因此无法搬运闭源栈, 改用开源 mt76。
+          - mt76 对 MT7986 内置 2.4G/5G 的驱动已合入主线, 但**信号强度 / 吞吐 /
+            LED 行为需实机验证**。如有问题请在 Issue 反馈。
+
+          ### 刷机与升级
+          - 出厂: 通过厂商 U-Boot 或刷机工具写入 `*-sysupgrade.bin` (eMMC/GPT)
+          - 升级: LuCI → 系统 → 备份/升级, 选择 `*-sysupgrade.bin`
+
+          ### 构建期防线
+          - 未注册函数守卫: ucode 全局函数表只有 71 个内置, 没有
+            `String()`/`Number()`/`unixtime()`/`parseInt()` 等;
+            覆盖 `.ut` 模板 + `.uc` 控制器 + rpcd 脚本三类源码
+          - POSIX ERE 守卫: ucode 的 `match()` 走 glibc `regcomp`,
+            括号表达式内的反斜杠不是转义符, `[A-Za-z0-9\-.]` 会变成
+            逆序范围 -> `REG_ERANGE` -> "Invalid character range"
+          - 出厂固件取证: 编译完成后拆 rootfs 逐条复验
+            (clx_s20p 设备 / Argon / Lucky / UPnP / mt76 在位 / MTK 栈零残留 / 版本号)
+        files: |
+          openwrt/bin/targets/mediatek/filogic/*
+          openwrt/config.buildinfo

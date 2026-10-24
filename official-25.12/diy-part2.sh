@@ -80,12 +80,17 @@ else
 fi
 
 # clx_s20p 设备必须被选中 (Target Profile)
-if grep -q "^CONFIG_TARGET_MULTI_PROFILE=y" .config || \
-   grep -q "^CONFIG_TARGET_mediatek_filogic_DEVICE_clx_s20p=y" .config; then
+#
+# 这里**不能**只看 CONFIG_TARGET_MULTI_PROFILE: 若设备因故没注册成功,
+# MULTI_PROFILE 依然是 y, make 会"无事可做"地成功退出, 最后 bin/targets 里
+# 一个镜像都没有 —— 编译步骤却显示 success, 直到 verify 才发现找不到固件。
+# 所以必须校验 clx_s20p 自己的符号真的在。
+if grep -qE "^CONFIG_TARGET_mediatek_filogic_DEVICE_clx_s20p=y" .config || \
+   grep -qE "^CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_clx_s20p=y" .config; then
 	echo "  [OK]      clx_s20p 设备已选中"
 else
-	echo "  [WARN]    未见 clx_s20p 的 DEVICE 符号, 依赖 multi-profile 默认选中"
-	echo "            (Target Profile 若为 Generic, 编出的镜像仍可用 sysupgrade 刷入)"
+	echo "  [MISSING] clx_s20p 设备未被选中 —— 编不出镜像"
+	MISSING=1
 fi
 
 # ---------------------------------------------------------

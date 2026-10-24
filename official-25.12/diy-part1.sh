@@ -376,15 +376,38 @@ for p in patched:
     print("   patched:", p)
 
 # ---- 5c. 镜像默认主题改为 Argon ----
-cfg = "feeds/luci/modules/luci-base/root/etc/config/luci"
-if os.path.isfile(cfg):
+# 旧写法只在 feeds 源路径里做 re.sub 替换; 若该文件里本来就没有
+# option mediaurlbase (新版 luci-base 不一定写这一行), re.sub 匹配不到就
+# **静默不生效**, 镜像默认主题仍是 bootstrap, 取证脚本的 mediaurlbase
+# 断言就会挂, 且这层失败在旧实现里只是一行 print, 看不出来。
+# 现在: 逐个候选路径尝试; 有则改、无则在 config core 'main' 段内追加;
+# 全都找不到就直接报错, 不让"没生效"悄悄溜过去。
+CANDS = [
+    "feeds/luci/modules/luci-base/root/etc/config/luci",
+    "package/feeds/luci/luci-base/root/etc/config/luci",
+]
+done = False
+for cfg in CANDS:
+    if not os.path.isfile(cfg):
+        continue
     s = open(cfg, encoding="utf-8").read()
-    s2 = re.sub(r"option mediaurlbase\s+\S+",
-                "option mediaurlbase /luci-static/argon", s)
-    open(cfg, "w", encoding="utf-8").write(s2)
-    print("默认主题 ->", [l for l in s2.splitlines() if "mediaurlbase" in l])
-else:
-    print("::warning:: 未找到默认主题配置:", cfg)
+    if re.search(r"option\s+mediaurlbase\s+\S+", s):
+        s2 = re.sub(r"option\s+mediaurlbase\s+\S+",
+                    "option mediaurlbase /luci-static/argon", s)
+    elif re.search(r"config\s+core\s+'main'", s):
+        s2 = re.sub(r"(config\s+core\s+'main'\n)",
+                    r"\1\toption mediaurlbase /luci-static/argon\n", s, count=1)
+    else:
+        s2 = s + "\nconfig core 'main'\n\toption mediaurlbase /luci-static/argon\n"
+    if s2 != s:
+        open(cfg, "w", encoding="utf-8").write(s2)
+    for l in s2.splitlines():
+        if "mediaurlbase" in l:
+            print("默认主题 ->", cfg, "|", l.strip())
+    done = True
+    break
+if not done:
+    print("::error:: 未找到 luci-base 默认主题配置, 无法把默认主题改为 argon")
 GUARD_PYEOF
 
 

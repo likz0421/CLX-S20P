@@ -57,6 +57,56 @@ PYEOF
 rm -f .config.pre-defconfig
 
 # ---------------------------------------------------------
+# 2b. 设备配方声明的包必须真实存在 (快速失败)
+#     Run 13 的教训: DEVICE_PACKAGES 里的 automount 在 OpenWrt 25.12.6 的
+#     feeds 里根本不存在, 但 make defconfig 对此**一声不吭** —— 它只在
+#     编译收尾阶段 (target/linux/install, per-device rootfs 装包) 才由 apk
+#     报 "automount (no such package)", 那时已经白白烧掉 1 小时 49 分。
+#     这里用全树 PKG_NAME 索引在几秒内把它拦下来。
+#     注意: kmod-* 不走 PKG_NAME 索引 (由内核构建按 Kconfig 生成), 跳过。
+# ---------------------------------------------------------
+echo "-------------------- 设备配方包存在性校验 --------------------"
+CLX_SECTION=$(awk '/# --- CLX-S20P \(ported for OpenWrt 25\.12\) ---/{f=1} f' \
+	target/linux/mediatek/image/filogic.mk)
+# 把行尾续行符合并成一行, 再取出 DEVICE_PACKAGES 列表
+DEV_PKGS=$(printf '%s\n' "$CLX_SECTION" \
+	| sed -e ':a' -e 'N' -e '$!ba' -e 's/\\\n[[:space:]]*/ /g' \
+	| grep "DEVICE_PACKAGES[[:space:]]*:=" \
+	| sed 's/.*DEVICE_PACKAGES[[:space:]]*:=[[:space:]]*//' \
+	| tr -s '[:space:]' '\n' | sed '/^$/d' | sort -u)
+
+if [ -z "$DEV_PKGS" ]; then
+	echo "::error::没能从 filogic.mk 里解析出 CLX-S20P 的 DEVICE_PACKAGES"
+	exit 1
+fi
+
+PKGIDX=$(mktemp)
+# -R 跟随符号链接, 这样 package/feeds/<feed>/* 也能被索引到
+grep -Rh "^PKG_NAME:=" package 2>/dev/null \
+	| sed 's/^PKG_NAME:[[:space:]]*//' | sort -u > "$PKGIDX"
+echo "  已索引 $(wc -l < "$PKGIDX") 个包名"
+
+BAD_PKGS=""
+for p in $DEV_PKGS; do
+	case "$p" in
+		kmod-*) continue ;;   # 内核模块, 由内核构建生成
+	esac
+	if ! grep -qx "$p" "$PKGIDX"; then
+		BAD_PKGS="$BAD_PKGS $p"
+	fi
+done
+rm -f "$PKGIDX"
+
+if [ -n "$BAD_PKGS" ]; then
+	echo "::error::设备配方里的包在本版本 OpenWrt 中不存在:${BAD_PKGS}"
+	echo "  -> 这些包会让 per-device rootfs 装包失败 (编译到最后一小时才炸)。"
+	echo "  -> 请改用官方等价包; 例如厂商私有 automount -> block-mount + blockd"
+	echo "     (package/system/fstools)。"
+	exit 1
+fi
+echo "  [OK] DEVICE_PACKAGES 全部存在 ($(echo $DEV_PKGS | wc -w) 个)"
+
+# ---------------------------------------------------------
 # 3. 硬校验: 关键包必须真的留在 .config 里
 # ---------------------------------------------------------
 echo "-------------------- 关键包校验 --------------------"

@@ -81,9 +81,18 @@ if [ -z "$DEV_PKGS" ]; then
 fi
 
 PKGIDX=$(mktemp)
-# -R 跟随符号链接, 这样 package/feeds/<feed>/* 也能被索引到
-grep -Rh "^PKG_NAME:=" package 2>/dev/null \
-	| sed 's/^PKG_NAME:[[:space:]]*//' | sort -u > "$PKGIDX"
+# -R 跟随符号链接, 这样 package/feeds/<feed>/* 也能被索引到。
+# 两类名字都要抓:
+#   1) PKG_NAME:=<name>            主包名 (注意把 ":=" 一起剥掉)
+#   2) define Package/<name>/...  **子包名** —— OpenWrt 大量工具是按子包发的:
+#      util-linux/Makefile 里 PKG_NAME:=util-linux, 但 blkid / blockdev /
+#      losetup 都是 define Package/<name>; f2fs-tools 同理出 mkf2fs / f2fsck;
+#      system/fstools 出 block-mount / blockd。只抓 PKG_NAME 会把这些
+#      全误判成"不存在" (第一版守卫就这么误报的)。
+{
+  grep -Rh "^PKG_NAME:=" package 2>/dev/null | sed 's/^PKG_NAME:[[:space:]]*=[[:space:]]*//'
+  grep -Rh "^define Package/" package 2>/dev/null | sed 's|^define Package/||; s|[/[:space:]].*||'
+} | sed '/^$/d' | sort -u > "$PKGIDX"
 echo "  已索引 $(wc -l < "$PKGIDX") 个包名"
 
 BAD_PKGS=""

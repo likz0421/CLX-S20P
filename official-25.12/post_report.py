@@ -23,11 +23,25 @@ PATH = "verify_reports/last_run.md"
 
 
 def gh(args, payload=None):
-    """调 gh api; text=True 时 input 必须是 str。"""
+    """调 gh api。
+
+    **必须**显式加 `--input -`, gh 才会把 stdin 上的 JSON 当成请求体。
+    这是 Run 13 报告"静默不落地"的真正根因: 之前只往 input= 里塞了
+    json.dumps(payload), 却没告诉 gh 去读 stdin, 于是发出**空 body**:
+      - Contents API  -> 400 "Body should be a JSON object"
+      - commit comment-> 422 "Invalid request. For 'links/0/schema',
+                             nil is not an object."
+    两个通道同时失败, 本地就永远看不到 verify 报告。
+    """
+    cmd = ["gh", "api"]
+    inp = None
+    if payload is not None:
+        cmd += ["--input", "-"]
+        inp = json.dumps(payload)
     try:
         return subprocess.run(
-            ["gh", "api"] + args,
-            input=(json.dumps(payload) if payload is not None else None),
+            cmd + args,
+            input=inp,
             capture_output=True, text=True, timeout=120,
         )
     except Exception as e:  # 绝不抛出, 否则会打断 verify 步骤

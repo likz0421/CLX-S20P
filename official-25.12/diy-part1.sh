@@ -46,7 +46,18 @@ bash "$GITHUB_WORKSPACE/official-25.12/port/apply.sh" "$(pwd)"
 	|| { echo "::error::移植包未放入 DTS"; exit 1; }
 grep -q "TARGET_DEVICES += clx_s20p" target/linux/mediatek/image/filogic.mk \
 	|| { echo "::error::移植包未注册设备"; exit 1; }
-echo "S20P 设备已注册: clx_s20p"
+
+# DEVICE_DTS_DIR 必须显式是 ../dts。
+# include/image.mk 的 Device/Build/dtb 是这样拼 DTS 路径的:
+#     $(if $(DEVICE_DTS_DIR),$(DEVICE_DTS_DIR),$(DTS_DIR))/$(DEVICE_DTS).dts
+# 省略 DEVICE_DTS_DIR 时回退到 $(DTS_DIR) = $(LINUX_DIR)/arch/arm64/boot/dts/
+# mediatek/ (内核源码树), 而我们的 DTS 只放在 target/linux/mediatek/dts/。
+# 结果: cpp 报 "No such file or directory", DTB 编不出来,
+#       target/linux/install 整体失败 —— 而且是在编译最后一小时才炸。
+# 上游 acer_predator-w6 等所有 tar 型设备都显式写了这一行。
+grep -q "^  DEVICE_DTS_DIR := ../dts" target/linux/mediatek/image/filogic.mk \
+	|| { echo "::error::设备配方缺少 DEVICE_DTS_DIR := ../dts (DTS 路径会指到内核树里, 必然编不出 DTB)"; exit 1; }
+echo "S20P 设备已注册: clx_s20p (DEVICE_DTS_DIR=../dts OK)"
 
 
 # ---------------------------------------------------------

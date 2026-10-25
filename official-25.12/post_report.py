@@ -49,25 +49,39 @@ def main():
         return
 
     # ---- 通道 1: 仓库文件 ----
-    exist = None
-    g = gh([f"repos/{repo}/contents/{PATH}?ref={ref}"])
-    if g is not None and g.returncode == 0:
-        try:
-            exist = json.loads(g.stdout).get("sha")
-        except Exception:
-            exist = None
-    payload = {
-        "message": f"verify report run {rid}",
-        "content": base64.b64encode(body.encode()).decode(),
-        "branch": ref,
-    }
-    if exist:
-        payload["sha"] = exist
-    p = gh(["-X", "PUT", f"repos/{repo}/contents/{PATH}"], payload)
-    if p is None:
-        print("PUT: gh 调用异常")
-    else:
-        print("PUT_rc=", p.returncode, (p.stdout or "")[:150], (p.stderr or "")[:250])
+    # 主文件名带 run id, 独一无二 -> 并发构建不会互相覆盖 / sha 冲突
+    # (之前多个 run 抢同一个 last_run.md, 后写的因 sha 过期 PUT 409 失败,
+    #  报告就被静默吞掉了)。
+    paths = []
+    if rid:
+        paths.append(f"verify_reports/run_{rid}.md")
+    paths.append(PATH)
+
+    def put(path):
+        exist = None
+        g = gh([f"repos/{repo}/contents/{path}?ref={ref}"])
+        if g is not None and g.returncode == 0:
+            try:
+                exist = json.loads(g.stdout).get("sha")
+            except Exception:
+                exist = None
+        payload = {
+            "message": f"verify report run {rid}",
+            "content": base64.b64encode(body.encode()).decode(),
+            "branch": ref,
+        }
+        if exist:
+            payload["sha"] = exist
+        r = gh(["-X", "PUT", f"repos/{repo}/contents/{path}"], payload)
+        if r is None:
+            print(f"PUT[{path}]: gh 调用异常")
+        else:
+            print(f"PUT[{path}]_rc=", r.returncode,
+                  (r.stdout or "")[:120], (r.stderr or "")[:200])
+        return r
+
+    results = [put(p) for p in paths]
+    p = results[0] if results else None
 
     # ---- 通道 2: commit comment ----
     if sha:
